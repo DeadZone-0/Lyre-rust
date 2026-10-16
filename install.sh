@@ -2,7 +2,13 @@
 set -eu
 
 REPO="DeadZone-0/Lyre-rust"
-BIN_DIR="${BIN_DIR:-$HOME/.local/bin}"
+if [ -z "${BIN_DIR:-}" ]; then
+    if [ "$(id -u)" -eq 0 ]; then
+        BIN_DIR="/usr/local/bin"
+    else
+        BIN_DIR="$HOME/.local/bin"
+    fi
+fi
 
 OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
 if [ "$OS" != "linux" ]; then
@@ -50,22 +56,41 @@ echo "Extracting binary..."
 tar -xzf "$TMP_DIR/lyre.tar.gz" -C "$TMP_DIR"
 
 if [ -f "$TMP_DIR/lyre" ]; then
-    mv "$TMP_DIR/lyre" "$BIN_DIR/lyre"
+    chmod +x "$TMP_DIR/lyre"
+    mv -f "$TMP_DIR/lyre" "$BIN_DIR/lyre"
 elif [ -f "$TMP_DIR/lyre-$TARGET/lyre" ]; then
-    mv "$TMP_DIR/lyre-$TARGET/lyre" "$BIN_DIR/lyre"
+    chmod +x "$TMP_DIR/lyre-$TARGET/lyre"
+    mv -f "$TMP_DIR/lyre-$TARGET/lyre" "$BIN_DIR/lyre"
 else
     echo "Error: failed to find lyre binary in downloaded archive" >&2
     exit 1
 fi
 
-chmod +x "$BIN_DIR/lyre"
 echo "Successfully installed lyre to $BIN_DIR/lyre"
 
 case ":$PATH:" in
-    *":$BIN_DIR:"*) ;;
+    *":$BIN_DIR:"*)
+        echo "You can now run 'lyre' from any terminal."
+        ;;
     *)
-        echo "Notice: $BIN_DIR is not in your PATH."
-        echo "Add it by running:"
-        echo "  export PATH=\"$BIN_DIR:\$PATH\""
+        ADDED=0
+        for RC in "$HOME/.zshrc" "$HOME/.bashrc" "$HOME/.profile"; do
+            if [ -f "$RC" ]; then
+                if ! grep -q "$BIN_DIR" "$RC"; then
+                    echo "export PATH=\"$BIN_DIR:\$PATH\"" >> "$RC"
+                    echo "Added $BIN_DIR to $RC"
+                    ADDED=1
+                    break
+                fi
+            fi
+        done
+
+        if [ "$ADDED" -eq 1 ]; then
+            echo "Restart your terminal (or run 'export PATH=\"$BIN_DIR:\$PATH\"'), then type 'lyre'."
+        else
+            echo "Notice: $BIN_DIR is not in your PATH."
+            echo "Add it by running:"
+            echo "  export PATH=\"$BIN_DIR:\$PATH\""
+        fi
         ;;
 esac
