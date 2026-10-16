@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use lofty::file::TaggedFileExt;
 use lofty::tag::Accessor;
@@ -28,7 +28,41 @@ impl Lyrics {
             }
         }
 
-        if let Some(content) = fetch_from_lrclib(audio_path) {
+        let (artist, title) = extract_tags(audio_path);
+        if let Some(t) = title {
+            if let Some(content) = fetch_lrclib_query(artist.as_deref(), &t) {
+                let _ = fs::write(&lrc_path, &content);
+                return Self {
+                    lines: parse_lrc(&content),
+                    offset_ms: 0,
+                };
+            }
+        }
+
+        Self::default()
+    }
+
+    pub fn load_cached(title: &str, artist: Option<&str>) -> Self {
+        let clean_t = clean_string(title);
+        let clean_a = artist.map(clean_string);
+
+        let cache_dir = get_cache_dir();
+        let safe_artist = clean_a.as_deref().unwrap_or("unknown");
+        let safe_filename = format!("{safe_artist}_{clean_t}.lrc")
+            .replace(['/', '\\', '\0', ':', '*', '?', '"', '<', '>', '|', ' '], "_");
+        let lrc_path = cache_dir.join(safe_filename);
+
+        if lrc_path.exists() {
+            if let Ok(content) = fs::read_to_string(&lrc_path) {
+                return Self {
+                    lines: parse_lrc(&content),
+                    offset_ms: 0,
+                };
+            }
+        }
+
+        if let Some(content) = fetch_lrclib_query(clean_a.as_deref(), &clean_t) {
+            let _ = fs::create_dir_all(&cache_dir);
             let _ = fs::write(&lrc_path, &content);
             return Self {
                 lines: parse_lrc(&content),
@@ -86,15 +120,12 @@ pub fn parse_lrc(content: &str) -> Vec<LyricLine> {
     lines
 }
 
-fn fetch_from_lrclib(audio_path: &Path) -> Option<String> {
-    let (artist, title) = extract_tags(audio_path);
-    let title = title?;
-
-    if let Some(ref art) = artist {
+fn fetch_lrclib_query(artist: Option<&str>, title: &str) -> Option<String> {
+    if let Some(art) = artist {
         let resp = ureq::get("https://lrclib.net/api/get")
             .set("User-Agent", "Lyre/0.1.0")
             .query("artist_name", art)
-            .query("track_name", &title)
+            .query("track_name", title)
             .call();
         if let Ok(res) = resp {
             if let Ok(text) = res.into_string() {
@@ -111,7 +142,7 @@ fn fetch_from_lrclib(audio_path: &Path) -> Option<String> {
 
     let q = match artist {
         Some(art) => format!("{art} {title}"),
-        None => title,
+        None => title.to_string(),
     };
     let resp = ureq::get("https://lrclib.net/api/search")
         .set("User-Agent", "Lyre/0.1.0")
@@ -134,6 +165,14 @@ fn fetch_from_lrclib(audio_path: &Path) -> Option<String> {
     }
 
     None
+}
+
+fn get_cache_dir() -> PathBuf {
+    if let Ok(home) = std::env::var("HOME") {
+        PathBuf::from(home).join(".cache").join("lyra")
+    } else {
+        PathBuf::from("/tmp/lyra")
+    }
 }
 
 fn extract_tags(audio_path: &Path) -> (Option<String>, Option<String>) {

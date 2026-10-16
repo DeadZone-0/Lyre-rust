@@ -1,11 +1,11 @@
 mod app;
 mod audio;
 mod lyrics;
+mod mpris_sync;
 mod theme;
 mod ui;
 
 use std::env;
-use std::path::PathBuf;
 use std::time::Duration;
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyEventKind};
@@ -13,8 +13,8 @@ use crossterm::event::{self, Event, KeyEventKind};
 use crate::app::App;
 
 fn main() -> Result<()> {
-    let target = env::args().nth(1).map(PathBuf::from);
-    let mut app = App::new(target)?;
+    let target = env::args().nth(1);
+    let mut app = App::new(target.as_deref())?;
 
     let mut term = ratatui::init();
     let res = run(&mut term, &mut app);

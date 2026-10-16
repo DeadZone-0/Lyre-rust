@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use anyhow::{Context, Result};
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use rodio::{
     source::SeekError, ChannelCount, Decoder, DeviceSinkBuilder, MixerDeviceSink,
     Player as AudioSink, Sample, SampleRate, Source,
@@ -13,6 +14,7 @@ use rodio::{
 pub struct Audio {
     _device: MixerDeviceSink,
     sink: AudioSink,
+    capture_stream: Option<cpal::Stream>,
     pub path: Option<PathBuf>,
     pub duration: Option<Duration>,
     pub samples: Arc<Mutex<VecDeque<f32>>>,
@@ -29,6 +31,7 @@ impl Audio {
         Ok(Self {
             _device: device,
             sink,
+            capture_stream: None,
             path: None,
             duration: None,
             samples: Arc::new(Mutex::new(VecDeque::with_capacity(4096))),
@@ -84,6 +87,14 @@ impl Audio {
         }
     }
 
+    pub fn pause(&self) {
+        self.sink.pause();
+    }
+
+    pub fn play(&self) {
+        self.sink.play();
+    }
+
     pub fn is_paused(&self) -> bool {
         self.sink.is_paused()
     }
@@ -102,6 +113,271 @@ impl Audio {
 
     pub fn set_volume(&self, vol: f32) {
         self.sink.set_volume(vol.clamp(0.0, 2.0));
+    }
+
+    pub fn start_capture(&mut self) -> Result<()> {
+        self.stop_capture();
+        let host = cpal::default_host();
+        let mut target_device = None;
+
+        if let Ok(devices) = host.input_devices() {
+            for dev in devices {
+                if let Ok(desc) = dev.description() {
+                    let name = desc.name().to_ascii_lowercase();
+                    if name.contains("monitor") {
+                        target_device = Some(dev);
+                        break;
+                    }
+                    let mut found_monitor = false;
+                    for ext in desc.extended() {
+                        if ext.to_ascii_lowercase().contains("monitor") {
+                            found_monitor = true;
+                            break;
+                        }
+                    }
+                    if found_monitor {
+                        target_device = Some(dev);
+                        break;
+                    }
+                }
+            }
+        }
+
+        let device = match target_device {
+            Some(d) => d,
+            None => host
+                .default_input_device()
+                .ok_or_else(|| anyhow::anyhow!("no audio input or monitor device found"))?,
+        };
+
+        let config = device.default_input_config()?;
+        let channels = config.channels() as usize;
+        let samples_ring = Arc::clone(&self.samples);
+        let stereo_ring = Arc::clone(&self.stereo);
+        let err_fn = |_| ();
+
+        let stream_config = config.config();
+        let stream = match config.sample_format() {
+            cpal::SampleFormat::F32 => device.build_input_stream(
+                stream_config,
+                move |data: &[f32], _| write_capture_f32(data, channels, &samples_ring, &stereo_ring),
+                err_fn,
+                None,
+            )?,
+            cpal::SampleFormat::I16 => device.build_input_stream(
+                stream_config,
+                move |data: &[i16], _| write_capture_i16(data, channels, &samples_ring, &stereo_ring),
+                err_fn,
+                None,
+            )?,
+            cpal::SampleFormat::U16 => device.build_input_stream(
+                stream_config,
+                move |data: &[u16], _| write_capture_u16(data, channels, &samples_ring, &stereo_ring),
+                err_fn,
+                None,
+            )?,
+            cpal::SampleFormat::I32 => device.build_input_stream(
+                stream_config,
+                move |data: &[i32], _| write_capture_i32(data, channels, &samples_ring, &stereo_ring),
+                err_fn,
+                None,
+            )?,
+            fmt => return Err(anyhow::anyhow!("unsupported audio sample format: {fmt:?}")),
+        };
+
+        stream.play()?;
+        self.capture_stream = Some(stream);
+        Ok(())
+    }
+
+    pub fn stop_capture(&mut self) {
+        if let Some(stream) = self.capture_stream.take() {
+            let _ = stream.pause();
+        }
+    }
+}
+
+fn write_capture_f32(
+    data: &[f32],
+    channels: usize,
+    samples: &Arc<Mutex<VecDeque<f32>>>,
+    stereo: &Arc<Mutex<(VecDeque<f32>, VecDeque<f32>)>>,
+) {
+    if channels == 0 || data.is_empty() {
+        return;
+    }
+    let frames = data.len() / channels;
+    if frames == 0 {
+        return;
+    }
+
+    if let Ok(mut ring) = samples.try_lock() {
+        for f in 0..frames {
+            let offset = f * channels;
+            let mut sum = 0.0f32;
+            for c in 0..channels {
+                sum += data[offset + c];
+            }
+            if ring.len() >= 4096 {
+                ring.pop_front();
+            }
+            ring.push_back(sum / channels as f32);
+        }
+    }
+
+    if let Ok(mut s_ring) = stereo.try_lock() {
+        for f in 0..frames {
+            let offset = f * channels;
+            let left = data[offset];
+            let right = if channels > 1 { data[offset + 1] } else { left };
+            if s_ring.0.len() >= 2048 {
+                s_ring.0.pop_front();
+                s_ring.1.pop_front();
+            }
+            s_ring.0.push_back(left);
+            s_ring.1.push_back(right);
+        }
+    }
+}
+
+fn write_capture_i16(
+    data: &[i16],
+    channels: usize,
+    samples: &Arc<Mutex<VecDeque<f32>>>,
+    stereo: &Arc<Mutex<(VecDeque<f32>, VecDeque<f32>)>>,
+) {
+    if channels == 0 || data.is_empty() {
+        return;
+    }
+    let frames = data.len() / channels;
+    if frames == 0 {
+        return;
+    }
+
+    if let Ok(mut ring) = samples.try_lock() {
+        for f in 0..frames {
+            let offset = f * channels;
+            let mut sum = 0.0f32;
+            for c in 0..channels {
+                sum += data[offset + c] as f32 / 32768.0;
+            }
+            if ring.len() >= 4096 {
+                ring.pop_front();
+            }
+            ring.push_back(sum / channels as f32);
+        }
+    }
+
+    if let Ok(mut s_ring) = stereo.try_lock() {
+        for f in 0..frames {
+            let offset = f * channels;
+            let left = data[offset] as f32 / 32768.0;
+            let right = if channels > 1 {
+                data[offset + 1] as f32 / 32768.0
+            } else {
+                left
+            };
+            if s_ring.0.len() >= 2048 {
+                s_ring.0.pop_front();
+                s_ring.1.pop_front();
+            }
+            s_ring.0.push_back(left);
+            s_ring.1.push_back(right);
+        }
+    }
+}
+
+fn write_capture_u16(
+    data: &[u16],
+    channels: usize,
+    samples: &Arc<Mutex<VecDeque<f32>>>,
+    stereo: &Arc<Mutex<(VecDeque<f32>, VecDeque<f32>)>>,
+) {
+    if channels == 0 || data.is_empty() {
+        return;
+    }
+    let frames = data.len() / channels;
+    if frames == 0 {
+        return;
+    }
+
+    if let Ok(mut ring) = samples.try_lock() {
+        for f in 0..frames {
+            let offset = f * channels;
+            let mut sum = 0.0f32;
+            for c in 0..channels {
+                sum += (data[offset + c] as f32 - 32768.0) / 32768.0;
+            }
+            if ring.len() >= 4096 {
+                ring.pop_front();
+            }
+            ring.push_back(sum / channels as f32);
+        }
+    }
+
+    if let Ok(mut s_ring) = stereo.try_lock() {
+        for f in 0..frames {
+            let offset = f * channels;
+            let left = (data[offset] as f32 - 32768.0) / 32768.0;
+            let right = if channels > 1 {
+                (data[offset + 1] as f32 - 32768.0) / 32768.0
+            } else {
+                left
+            };
+            if s_ring.0.len() >= 2048 {
+                s_ring.0.pop_front();
+                s_ring.1.pop_front();
+            }
+            s_ring.0.push_back(left);
+            s_ring.1.push_back(right);
+        }
+    }
+}
+
+fn write_capture_i32(
+    data: &[i32],
+    channels: usize,
+    samples: &Arc<Mutex<VecDeque<f32>>>,
+    stereo: &Arc<Mutex<(VecDeque<f32>, VecDeque<f32>)>>,
+) {
+    if channels == 0 || data.is_empty() {
+        return;
+    }
+    let frames = data.len() / channels;
+    if frames == 0 {
+        return;
+    }
+
+    if let Ok(mut ring) = samples.try_lock() {
+        for f in 0..frames {
+            let offset = f * channels;
+            let mut sum = 0.0f32;
+            for c in 0..channels {
+                sum += data[offset + c] as f32 / 2147483648.0;
+            }
+            if ring.len() >= 4096 {
+                ring.pop_front();
+            }
+            ring.push_back(sum / channels as f32);
+        }
+    }
+
+    if let Ok(mut s_ring) = stereo.try_lock() {
+        for f in 0..frames {
+            let offset = f * channels;
+            let left = data[offset] as f32 / 2147483648.0;
+            let right = if channels > 1 {
+                data[offset + 1] as f32 / 2147483648.0
+            } else {
+                left
+            };
+            if s_ring.0.len() >= 2048 {
+                s_ring.0.pop_front();
+                s_ring.1.pop_front();
+            }
+            s_ring.0.push_back(left);
+            s_ring.1.push_back(right);
+        }
     }
 }
 

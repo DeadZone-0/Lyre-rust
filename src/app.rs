@@ -2,16 +2,24 @@ use std::f32::consts::PI;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
+use std::time::Duration;
 use anyhow::{anyhow, Result};
 use crossterm::event::KeyCode;
 use rustfft::{num_complex::Complex, Fft, FftPlanner};
 
 use crate::audio::Audio;
 use crate::lyrics::Lyrics;
+use crate::mpris_sync;
 use crate::theme::{Theme, THEMES};
 
 const FFT_SIZE: usize = 2048;
 const NUM_BINS: usize = 64;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum AppMode {
+    Local,
+    System,
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum VizMode {
@@ -40,6 +48,14 @@ impl VizMode {
 
 pub struct App {
     pub audio: Audio,
+    pub mode: AppMode,
+    pub mpris_active: bool,
+    pub mpris_title: String,
+    pub mpris_artist: String,
+    pub mpris_player: String,
+    pub mpris_pos: Duration,
+    pub mpris_len: Duration,
+    pub mpris_playing: bool,
     pub tracks: Vec<PathBuf>,
     pub idx: usize,
     pub selected_idx: usize,
@@ -53,6 +69,9 @@ pub struct App {
     pub lyrics: Lyrics,
     pub viz_mode: VizMode,
     pub theme_idx: usize,
+    last_mpris_title: String,
+    last_mpris_artist: String,
+    mpris_tick: u8,
     fft: Arc<dyn Fft<f32>>,
     window: Vec<f32>,
     fft_buf: Vec<Complex<f32>>,
@@ -61,36 +80,42 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(target: Option<PathBuf>) -> Result<Self> {
+    pub fn new(target: Option<&str>) -> Result<Self> {
         let audio = Audio::new()?;
-        let (tracks, start_idx) = if let Some(p) = target {
-            if !p.exists() {
-                return Err(anyhow!("path does not exist: {}", p.display()));
-            }
-            if p.is_dir() {
-                let list = collect_tracks(&p)?;
-                if list.is_empty() {
-                    return Err(anyhow!("no audio files found (.mp3, .wav, .flac) in: {}", p.display()));
-                }
-                (list, 0)
+        let (tracks, start_idx, initial_mode) = if let Some(arg) = target {
+            if arg == "--system" || arg == "-s" {
+                let list = collect_tracks(Path::new(".")).unwrap_or_default();
+                (list, 0, AppMode::System)
             } else {
-                let parent = p.parent().unwrap_or(Path::new("."));
-                let mut list = collect_tracks(parent)?;
-                if list.is_empty() {
-                    list.push(p.clone());
+                let p = PathBuf::from(arg);
+                if !p.exists() {
+                    return Err(anyhow!("path does not exist: {}", p.display()));
                 }
-                let mut pos = 0;
-                for (i, t) in list.iter().enumerate() {
-                    if t == &p {
-                        pos = i;
-                        break;
+                if p.is_dir() {
+                    let list = collect_tracks(&p)?;
+                    if list.is_empty() {
+                        return Err(anyhow!("no audio files found (.mp3, .wav, .flac) in: {}", p.display()));
                     }
+                    (list, 0, AppMode::Local)
+                } else {
+                    let parent = p.parent().unwrap_or(Path::new("."));
+                    let mut list = collect_tracks(parent).unwrap_or_default();
+                    if list.is_empty() {
+                        list.push(p.clone());
+                    }
+                    let mut pos = 0;
+                    for (i, t) in list.iter().enumerate() {
+                        if t == &p {
+                            pos = i;
+                            break;
+                        }
+                    }
+                    (list, pos, AppMode::Local)
                 }
-                (list, pos)
             }
         } else {
-            let list = collect_tracks(Path::new("."))?;
-            (list, 0)
+            let list = collect_tracks(Path::new(".")).unwrap_or_default();
+            (list, 0, AppMode::System)
         };
 
         let mut planner = FftPlanner::<f32>::new();
@@ -108,6 +133,14 @@ impl App {
 
         let mut app = Self {
             audio,
+            mode: initial_mode,
+            mpris_active: false,
+            mpris_title: String::new(),
+            mpris_artist: String::new(),
+            mpris_player: String::new(),
+            mpris_pos: Duration::ZERO,
+            mpris_len: Duration::ZERO,
+            mpris_playing: false,
             tracks,
             idx: start_idx,
             selected_idx: start_idx,
@@ -121,6 +154,9 @@ impl App {
             lyrics: Lyrics::default(),
             viz_mode: VizMode::Spectrum,
             theme_idx: 0,
+            last_mpris_title: String::new(),
+            last_mpris_artist: String::new(),
+            mpris_tick: 0,
             fft,
             window,
             fft_buf,
@@ -128,7 +164,10 @@ impl App {
             lyrics_rx,
         };
 
-        if !app.tracks.is_empty() {
+        if app.mode == AppMode::System {
+            let _ = app.audio.start_capture();
+            app.poll_mpris_immediate();
+        } else if !app.tracks.is_empty() {
             let _ = app.load_current();
         }
 
@@ -137,6 +176,86 @@ impl App {
 
     pub fn theme(&self) -> &'static Theme {
         &THEMES[self.theme_idx]
+    }
+
+    pub fn toggle_mode(&mut self) {
+        if self.mode == AppMode::Local {
+            self.mode = AppMode::System;
+            if !self.audio.is_paused() {
+                self.audio.pause();
+            }
+            let _ = self.audio.start_capture();
+            self.poll_mpris_immediate();
+        } else {
+            self.mode = AppMode::Local;
+            self.audio.stop_capture();
+            if !self.tracks.is_empty() && self.audio.is_paused() {
+                self.audio.play();
+            }
+            self.lyrics = Lyrics::default();
+            if !self.tracks.is_empty() {
+                let p = self.tracks[self.idx].clone();
+                let tx = self.lyrics_tx.clone();
+                std::thread::spawn(move || {
+                    let lrc = Lyrics::load(&p);
+                    let _ = tx.send(lrc);
+                });
+            }
+        }
+    }
+
+    fn poll_mpris_immediate(&mut self) {
+        let active = mpris_sync::poll(
+            &mut self.mpris_title,
+            &mut self.mpris_artist,
+            &mut self.mpris_player,
+            &mut self.mpris_pos,
+            &mut self.mpris_len,
+            &mut self.mpris_playing,
+        );
+        self.mpris_active = active;
+
+        if active {
+            if self.mpris_title != self.last_mpris_title || self.mpris_artist != self.last_mpris_artist {
+                self.last_mpris_title = self.mpris_title.clone();
+                self.last_mpris_artist = self.mpris_artist.clone();
+                self.lyrics = Lyrics::default();
+                let title = self.mpris_title.clone();
+                let artist = if self.mpris_artist.is_empty() {
+                    None
+                } else {
+                    Some(self.mpris_artist.clone())
+                };
+                let tx = self.lyrics_tx.clone();
+                std::thread::spawn(move || {
+                    let lrc = Lyrics::load_cached(&title, artist.as_deref());
+                    let _ = tx.send(lrc);
+                });
+            }
+        } else {
+            self.last_mpris_title.clear();
+            self.last_mpris_artist.clear();
+        }
+    }
+
+    pub fn current_pos(&self) -> Duration {
+        if self.mode == AppMode::System {
+            self.mpris_pos
+        } else {
+            self.audio.pos()
+        }
+    }
+
+    pub fn current_duration(&self) -> Option<Duration> {
+        if self.mode == AppMode::System {
+            if self.mpris_active && !self.mpris_len.is_zero() {
+                Some(self.mpris_len)
+            } else {
+                None
+            }
+        } else {
+            self.audio.duration
+        }
     }
 
     pub fn load_current(&mut self) -> Result<()> {
@@ -171,6 +290,7 @@ impl App {
                 }
             }
             KeyCode::Char('?') => self.show_help = !self.show_help,
+            KeyCode::Char('m') => self.toggle_mode(),
             KeyCode::Tab | KeyCode::Char('p') => {
                 self.show_sidebar = !self.show_sidebar;
                 if self.show_sidebar {
@@ -189,12 +309,41 @@ impl App {
             }
             KeyCode::Enter => {
                 if self.show_sidebar && !self.tracks.is_empty() {
+                    if self.mode == AppMode::System {
+                        self.toggle_mode();
+                    }
                     self.idx = self.selected_idx;
                     self.load_current()?;
                 }
             }
-            KeyCode::Char(' ') => self.audio.toggle_pause(),
-            KeyCode::Char('s') => self.skip()?,
+            KeyCode::Char(' ') => {
+                if self.mode == AppMode::System {
+                    mpris_sync::play_pause();
+                } else {
+                    self.audio.toggle_pause();
+                }
+            }
+            KeyCode::Char('n') => {
+                if self.mode == AppMode::System {
+                    mpris_sync::next();
+                } else {
+                    self.skip()?;
+                }
+            }
+            KeyCode::Char('b') => {
+                if self.mode == AppMode::System {
+                    mpris_sync::previous();
+                } else {
+                    self.prev_track()?;
+                }
+            }
+            KeyCode::Char('s') => {
+                if self.mode == AppMode::System {
+                    mpris_sync::next();
+                } else {
+                    self.skip()?;
+                }
+            }
             KeyCode::Char('v') => self.viz_mode = self.viz_mode.next(),
             KeyCode::Char('t') => self.theme_idx = (self.theme_idx + 1) % THEMES.len(),
             KeyCode::Char('+') | KeyCode::Char('=') => {
@@ -221,12 +370,32 @@ impl App {
         self.load_current()
     }
 
+    pub fn prev_track(&mut self) -> Result<()> {
+        if self.tracks.is_empty() {
+            return Ok(());
+        }
+        if self.idx == 0 {
+            self.idx = self.tracks.len() - 1;
+        } else {
+            self.idx -= 1;
+        }
+        self.selected_idx = self.idx;
+        self.load_current()
+    }
+
     pub fn tick(&mut self) -> Result<()> {
-        if !self.tracks.is_empty() && self.audio.is_empty() && !self.audio.is_paused() {
-            if self.idx + 1 < self.tracks.len() {
-                self.idx += 1;
-                self.selected_idx = self.idx;
-                self.load_current()?;
+        if self.mode == AppMode::Local {
+            if !self.tracks.is_empty() && self.audio.is_empty() && !self.audio.is_paused() {
+                if self.idx + 1 < self.tracks.len() {
+                    self.idx += 1;
+                    self.selected_idx = self.idx;
+                    self.load_current()?;
+                }
+            }
+        } else {
+            self.mpris_tick = (self.mpris_tick + 1) % 15;
+            if self.mpris_tick == 0 {
+                self.poll_mpris_immediate();
             }
         }
 
@@ -272,7 +441,7 @@ impl App {
         let decay = 0.035f32;
         let peak_decay = 0.008f32;
 
-        if self.audio.is_paused() || self.audio.is_empty() || self.tracks.is_empty() {
+        if self.mode == AppMode::Local && (self.audio.is_paused() || self.audio.is_empty() || self.tracks.is_empty()) {
             for b in &mut self.bins {
                 *b = (*b - decay).max(0.0);
             }
@@ -381,7 +550,15 @@ impl App {
     }
 
     pub fn state_str(&self) -> &'static str {
-        if self.tracks.is_empty() {
+        if self.mode == AppMode::System {
+            if !self.mpris_active {
+                "Waiting"
+            } else if self.mpris_playing {
+                "Playing"
+            } else {
+                "Paused"
+            }
+        } else if self.tracks.is_empty() {
             "Stopped"
         } else if self.audio.is_paused() {
             "Paused"

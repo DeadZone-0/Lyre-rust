@@ -10,7 +10,7 @@ use ratatui::{
     Frame,
 };
 
-use crate::app::{App, VizMode};
+use crate::app::{App, AppMode, VizMode};
 use crate::theme::blend;
 
 const BLOCKS: [char; 9] = [' ', ' ', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
@@ -36,24 +36,52 @@ pub fn render(f: &mut Frame, app: &App) {
 
 fn render_top(f: &mut Frame, app: &App, area: Rect) {
     let th = app.theme();
-    let state = app.state_str();
-    let name = app.track_name();
-    let vol = (app.audio.volume() * 100.0).round() as u32;
-    let track_num = if app.tracks.is_empty() {
-        String::new()
+    let text = if app.mode == AppMode::System {
+        if app.mpris_active {
+            let state = if app.mpris_playing { "Playing" } else { "Paused" };
+            let title_str = if app.mpris_artist.is_empty() {
+                app.mpris_title.clone()
+            } else {
+                format!("{} - {}", app.mpris_artist, app.mpris_title)
+            };
+            Line::from(vec![
+                Span::styled(format!("[{state}] "), Style::default().fg(th.primary).add_modifier(Modifier::BOLD)),
+                Span::styled(title_str, Style::default().fg(th.text)),
+                Span::styled(format!(" | via {}", app.mpris_player), Style::default().fg(th.secondary)),
+                Span::styled(" | ", Style::default().fg(th.dimmed)),
+                Span::styled("System Mode", Style::default().fg(th.accent)),
+                Span::styled(" | ", Style::default().fg(th.dimmed)),
+                Span::styled(th.name, Style::default().fg(th.secondary)),
+            ])
+        } else {
+            Line::from(vec![
+                Span::styled("[Waiting for media player...]", Style::default().fg(th.dimmed).add_modifier(Modifier::ITALIC)),
+                Span::styled(" | ", Style::default().fg(th.dimmed)),
+                Span::styled("System Mode", Style::default().fg(th.accent)),
+                Span::styled(" | ", Style::default().fg(th.dimmed)),
+                Span::styled(th.name, Style::default().fg(th.secondary)),
+            ])
+        }
     } else {
-        format!(" [{}/{}]", app.idx + 1, app.tracks.len())
-    };
+        let state = app.state_str();
+        let name = app.track_name();
+        let vol = (app.audio.volume() * 100.0).round() as u32;
+        let track_num = if app.tracks.is_empty() {
+            String::new()
+        } else {
+            format!(" [{}/{}]", app.idx + 1, app.tracks.len())
+        };
 
-    let text = Line::from(vec![
-        Span::styled(format!("[{state}] "), Style::default().fg(th.primary).add_modifier(Modifier::BOLD)),
-        Span::styled(name, Style::default().fg(th.text)),
-        Span::styled(track_num, Style::default().fg(th.dimmed)),
-        Span::styled(" | ", Style::default().fg(th.dimmed)),
-        Span::styled(format!("Vol: {vol}%"), Style::default().fg(th.text)),
-        Span::styled(" | ", Style::default().fg(th.dimmed)),
-        Span::styled(th.name, Style::default().fg(th.secondary)),
-    ]);
+        Line::from(vec![
+            Span::styled(format!("[{state}] "), Style::default().fg(th.primary).add_modifier(Modifier::BOLD)),
+            Span::styled(name, Style::default().fg(th.text)),
+            Span::styled(track_num, Style::default().fg(th.dimmed)),
+            Span::styled(" | ", Style::default().fg(th.dimmed)),
+            Span::styled(format!("Vol: {vol}%"), Style::default().fg(th.text)),
+            Span::styled(" | ", Style::default().fg(th.dimmed)),
+            Span::styled(th.name, Style::default().fg(th.secondary)),
+        ])
+    };
 
     let block = Block::bordered()
         .border_type(BorderType::Plain)
@@ -292,7 +320,7 @@ fn render_lyrics(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    let pos = app.audio.pos();
+    let pos = app.current_pos();
     let cur = app.lyrics.current_index(pos);
     let center_idx = cur.unwrap_or(0) as i32;
     let mid_y = inner.height as i32 / 2;
@@ -319,8 +347,8 @@ fn render_lyrics(f: &mut Frame, app: &App, area: Rect) {
 
 fn render_bottom(f: &mut Frame, app: &App, area: Rect) {
     let th = app.theme();
-    let pos = app.audio.pos();
-    let dur = app.audio.duration;
+    let pos = app.current_pos();
+    let dur = app.current_duration();
 
     let (ratio, label) = match dur {
         Some(d) if d.as_secs() > 0 => {
@@ -357,8 +385,8 @@ fn render_bottom(f: &mut Frame, app: &App, area: Rect) {
 fn render_help(f: &mut Frame, app: &App) {
     let th = app.theme();
     let area = f.area();
-    let w = 46.min(area.width);
-    let h = 15.min(area.height);
+    let w = 48.min(area.width);
+    let h = 17.min(area.height);
     let rect = Rect {
         x: area.x + (area.width.saturating_sub(w)) / 2,
         y: area.y + (area.height.saturating_sub(h)) / 2,
@@ -370,7 +398,9 @@ fn render_help(f: &mut Frame, app: &App) {
 
     let binds = [
         ("Space", "Play / Pause"),
+        ("n / b", "Next / Prev Track"),
         ("s", "Restart / Skip"),
+        ("m", "Toggle Local / System Mode"),
         ("+ / -", "Volume Up / Down"),
         ("[ / ]", "Lyrics Offset (-/+100ms)"),
         ("v", "Visualizer Mode"),
