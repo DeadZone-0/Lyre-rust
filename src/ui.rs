@@ -184,6 +184,82 @@ fn render_visualizer(f: &mut Frame, app: &App, area: Rect) {
         .title(title);
 
     match app.viz_mode {
+        VizMode::Bars => {
+            let inner = block.inner(area);
+            f.render_widget(block, area);
+            if inner.width < 4 || inner.height < 2 || app.bins.is_empty() {
+                return;
+            }
+
+            let w = inner.width as usize;
+            let h = inner.height as usize;
+            let bar_w = if w > 50 { 2 } else { 1 };
+            let gap = 1;
+            let stride = bar_w + gap;
+            let bar_count = ((w + gap) / stride).min(app.bins.len());
+            if bar_count == 0 {
+                return;
+            }
+            let used = bar_count * stride - gap;
+            let pad = (w - used) / 2;
+
+            let mut bar_levels = Vec::with_capacity(bar_count);
+            let mut peak_rows = Vec::with_capacity(bar_count);
+
+            for j in 0..bar_count {
+                let t = (j as f32 / (bar_count - 1).max(1) as f32) * (app.bins.len() - 1) as f32;
+                let i = t.floor() as usize;
+                let frac = t - i as f32;
+                let next_i = (i + 1).min(app.bins.len() - 1);
+                let v = app.bins[i] * (1.0 - frac) + app.bins[next_i] * frac;
+                let p = app.peaks[i] * (1.0 - frac) + app.peaks[next_i] * frac;
+
+                let eighths = (v * (h * 8) as f32).round() as usize;
+                let p_eighths = (p * (h * 8) as f32).round() as usize;
+                bar_levels.push(eighths);
+                peak_rows.push(p_eighths / 8);
+            }
+
+            let mut lines = Vec::with_capacity(h);
+            for y in 0..h {
+                let row = h - 1 - y;
+                let min_lvl = row * 8;
+                let max_lvl = min_lvl + 8;
+
+                let mut row_spans = Vec::new();
+                if pad > 0 {
+                    row_spans.push(Span::raw(" ".repeat(pad)));
+                }
+
+                for j in 0..bar_count {
+                    let lvl = bar_levels[j];
+                    let pk = peak_rows[j];
+
+                    let (ch, fg) = if lvl >= max_lvl {
+                        ('█', th.primary)
+                    } else if lvl > min_lvl {
+                        (BLOCKS[lvl - min_lvl], th.primary)
+                    } else if pk == row && lvl > 0 {
+                        ('─', th.secondary)
+                    } else {
+                        (' ', th.primary)
+                    };
+
+                    let mut s = String::with_capacity(stride);
+                    for _ in 0..bar_w {
+                        s.push(ch);
+                    }
+                    if j + 1 < bar_count {
+                        s.push(' ');
+                    }
+                    row_spans.push(Span::styled(s, Style::default().fg(fg)));
+                }
+
+                lines.push(Line::from(row_spans));
+            }
+
+            f.render_widget(Paragraph::new(lines), inner);
+        }
         VizMode::Spectrum => {
             let inner = block.inner(area);
             f.render_widget(block, area);

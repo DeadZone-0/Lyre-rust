@@ -23,6 +23,7 @@ pub enum AppMode {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum VizMode {
+    Bars,
     Spectrum,
     Oscilloscope,
     CenterWave,
@@ -30,18 +31,26 @@ pub enum VizMode {
 
 impl VizMode {
     pub fn next(self) -> Self {
-        match self {
-            Self::Spectrum => Self::Oscilloscope,
-            Self::Oscilloscope => Self::CenterWave,
-            Self::CenterWave => Self::Spectrum,
+        if self == Self::Bars {
+            Self::Spectrum
+        } else if self == Self::Spectrum {
+            Self::Oscilloscope
+        } else if self == Self::Oscilloscope {
+            Self::CenterWave
+        } else {
+            Self::Bars
         }
     }
 
     pub fn name(self) -> &'static str {
-        match self {
-            Self::Spectrum => "Spectrum",
-            Self::Oscilloscope => "Oscilloscope",
-            Self::CenterWave => "Stereo Wave",
+        if self == Self::Bars {
+            "CAVA Bars"
+        } else if self == Self::Spectrum {
+            "Spectrum"
+        } else if self == Self::Oscilloscope {
+            "Oscilloscope"
+        } else {
+            "Stereo Wave"
         }
     }
 }
@@ -152,7 +161,7 @@ impl App {
             bass_avg: 0.0,
             pulse: 0.0,
             lyrics: Lyrics::default(),
-            viz_mode: VizMode::Spectrum,
+            viz_mode: VizMode::Bars,
             theme_idx: 0,
             last_mpris_title: String::new(),
             last_mpris_artist: String::new(),
@@ -438,39 +447,32 @@ impl App {
     }
 
     fn update_fft(&mut self) {
-        let decay = 0.035f32;
-        let peak_decay = 0.008f32;
-
         if self.mode == AppMode::Local && (self.audio.is_paused() || self.audio.is_empty() || self.tracks.is_empty()) {
-            for b in &mut self.bins {
-                *b = (*b - decay).max(0.0);
+            for b in 0..self.bins.len() {
+                self.bins[b] = (self.bins[b] * 0.94 - 0.002).max(0.0);
+                self.peaks[b] = (self.peaks[b] - 0.0035).max(0.0);
             }
-            for p in &mut self.peaks {
-                *p = (*p - peak_decay * 2.0).max(0.0);
-            }
-            self.pulse = (self.pulse - 0.07).max(0.0);
+            self.pulse = (self.pulse - 0.04).max(0.0);
             return;
         }
 
-        let Ok(ring) = self.audio.samples.try_lock() else {
-            for b in &mut self.bins {
-                *b = (*b - decay).max(0.0);
+        let lock_res = self.audio.samples.try_lock();
+        if lock_res.is_err() {
+            for b in 0..self.bins.len() {
+                self.bins[b] = (self.bins[b] * 0.94 - 0.002).max(0.0);
+                self.peaks[b] = (self.peaks[b] - 0.0035).max(0.0);
             }
-            for p in &mut self.peaks {
-                *p = (*p - peak_decay * 2.0).max(0.0);
-            }
-            self.pulse = (self.pulse - 0.07).max(0.0);
+            self.pulse = (self.pulse - 0.04).max(0.0);
             return;
-        };
+        }
+        let ring = lock_res.unwrap();
 
         if ring.len() < FFT_SIZE {
-            for b in &mut self.bins {
-                *b = (*b - decay).max(0.0);
+            for b in 0..self.bins.len() {
+                self.bins[b] = (self.bins[b] * 0.94 - 0.002).max(0.0);
+                self.peaks[b] = (self.peaks[b] - 0.0035).max(0.0);
             }
-            for p in &mut self.peaks {
-                *p = (*p - peak_decay * 2.0).max(0.0);
-            }
-            self.pulse = (self.pulse - 0.07).max(0.0);
+            self.pulse = (self.pulse - 0.04).max(0.0);
             return;
         }
 
@@ -480,29 +482,31 @@ impl App {
             let w = self.window[i];
             self.fft_buf[i] = Complex { re: s * w, im: 0.0 };
         }
+        drop(ring);
         self.fft.process(&mut self.fft_buf);
 
         let half = FFT_SIZE / 2;
-        let mut mags = Vec::with_capacity(half);
-        for c in &self.fft_buf[..half] {
-            mags.push((c.re * c.re + c.im * c.im).sqrt() / FFT_SIZE as f32);
+        let mut mags = vec![0.0f32; half];
+        for i in 0..half {
+            let c = self.fft_buf[i];
+            mags[i] = (c.re * c.re + c.im * c.im).sqrt() / FFT_SIZE as f32;
         }
 
-        let mut bass_sum = 0.0;
-        for &m in &mags[1..=6] {
-            bass_sum += m;
+        let mut bass_sum = 0.0f32;
+        for i in 1..=6 {
+            bass_sum += mags[i];
         }
         let bass_energy = bass_sum / 6.0;
-
         if bass_energy > self.bass_avg * 1.35 && bass_energy > 0.012 {
             self.pulse = 1.0;
         }
         self.bass_avg = self.bass_avg * 0.94 + bass_energy * 0.06;
-        self.pulse = (self.pulse - 0.07).max(0.0);
+        self.pulse = (self.pulse - 0.04).max(0.0);
 
-        let f_min = 25.0f32;
-        let f_max = 18000.0f32;
+        let f_min = 42.0f32;
+        let f_max = 16000.0f32;
         let nyq = 22050.0f32;
+        let mut raw = [0.0f32; NUM_BINS];
 
         for b in 0..NUM_BINS {
             let p0 = b as f32 / NUM_BINS as f32;
@@ -516,27 +520,55 @@ impl App {
             let start = i0.clamp(1, half - 1);
             let end = i1.clamp(start + 1, half);
 
-            let mut sum = 0.0;
-            for &m in &mags[start..end] {
-                sum += m;
+            let mut max_m = 0.0f32;
+            let mut sum_m = 0.0f32;
+            for i in start..end {
+                let m = mags[i];
+                if m > max_m {
+                    max_m = m;
+                }
+                sum_m += m;
             }
-            let avg = sum / (end - start) as f32;
+            let avg_m = sum_m / (end - start) as f32;
+            let band_mag = max_m * 0.75 + avg_m * 0.25;
 
-            let db = 20.0 * (avg * 4.0 + 1e-6).log10();
-            let norm = ((db + 48.0) / 48.0).clamp(0.0, 1.0);
+            let t = b as f32 / (NUM_BINS - 1) as f32;
+            let eq = 1.0 + 7.5 * t.powf(1.3);
+            let bass_taper = if b == 0 { 0.75 } else if b == 1 { 0.88 } else { 1.0 };
+            let val = band_mag * eq * bass_taper * 6.0;
 
-            let prev = self.bins[b];
-            self.bins[b] = if norm > prev {
-                norm
+            let db = 20.0 * (val + 1e-5).log10();
+            let norm = ((db + 40.0) / 40.0).clamp(0.0, 1.0);
+            raw[b] = norm;
+        }
+
+        let mut smooth = [0.0f32; NUM_BINS];
+        for b in 0..NUM_BINS {
+            if b == 0 {
+                smooth[0] = raw[0] * 0.65 + raw[1] * 0.35;
+            } else if b == NUM_BINS - 1 {
+                smooth[b] = raw[b] * 0.65 + raw[b - 1] * 0.35;
             } else {
-                (prev - decay).max(norm).max(0.0)
+                smooth[b] = raw[b - 1] * 0.22 + raw[b] * 0.56 + raw[b + 1] * 0.22;
+            }
+        }
+
+        for b in 0..NUM_BINS {
+            let target = smooth[b];
+            let prev = self.bins[b];
+
+            let curr = if target > prev {
+                prev + (target - prev) * 0.34
+            } else {
+                (prev * 0.935 - 0.002).max(0.0).max(target)
             };
+            self.bins[b] = curr;
 
             let prev_peak = self.peaks[b];
-            self.peaks[b] = if norm > prev_peak {
-                norm
+            self.peaks[b] = if curr >= prev_peak {
+                curr
             } else {
-                (prev_peak - peak_decay).max(0.0)
+                (prev_peak - 0.0035).max(curr).max(0.0)
             };
         }
     }
