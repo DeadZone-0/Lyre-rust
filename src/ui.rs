@@ -8,6 +8,8 @@ use ratatui::{
 
 use crate::app::App;
 
+const BLOCKS: [char; 9] = [' ', ' ', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+
 pub fn render(f: &mut Frame, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -19,7 +21,7 @@ pub fn render(f: &mut Frame, app: &App) {
         .split(f.area());
 
     render_top(f, app, chunks[0]);
-    render_middle(f, chunks[1]);
+    render_middle(f, app, chunks[1]);
     render_bottom(f, app, chunks[2]);
 }
 
@@ -47,7 +49,7 @@ fn render_top(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(text).block(block), area);
 }
 
-fn render_middle(f: &mut Frame, area: Rect) {
+fn render_middle(f: &mut Frame, app: &App, area: Rect) {
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
@@ -56,15 +58,59 @@ fn render_middle(f: &mut Frame, area: Rect) {
         ])
         .split(area);
 
-    let viz_block = Block::bordered()
-        .border_type(BorderType::Plain)
-        .title("Visualizer");
-    f.render_widget(viz_block, chunks[0]);
+    render_visualizer(f, app, chunks[0]);
 
     let lyrics_block = Block::bordered()
         .border_type(BorderType::Plain)
         .title("Lyrics");
     f.render_widget(lyrics_block, chunks[1]);
+}
+
+fn render_visualizer(f: &mut Frame, app: &App, area: Rect) {
+    let block = Block::bordered()
+        .border_type(BorderType::Plain)
+        .title("Visualizer");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if inner.width == 0 || inner.height == 0 || app.bins.is_empty() {
+        return;
+    }
+
+    let width = inner.width as usize;
+    let height = inner.height as usize;
+    let mut lines = Vec::with_capacity(height);
+
+    for y in 0..height {
+        let row_from_bottom = height - 1 - y;
+        let min_level = row_from_bottom * 8;
+        let max_level = min_level + 8;
+
+        let mut row_chars = String::with_capacity(width);
+        for x in 0..width {
+            let t = (x as f32 / width as f32) * (app.bins.len() - 1) as f32;
+            let i = t.floor() as usize;
+            let frac = t - i as f32;
+            let v = if i + 1 < app.bins.len() {
+                app.bins[i] * (1.0 - frac) + app.bins[i + 1] * frac
+            } else {
+                app.bins[i]
+            };
+
+            let col_eighths = (v * (height * 8) as f32).round() as usize;
+            let ch = if col_eighths >= max_level {
+                '█'
+            } else if col_eighths <= min_level {
+                ' '
+            } else {
+                BLOCKS[col_eighths - min_level]
+            };
+            row_chars.push(ch);
+        }
+        lines.push(Line::from(Span::styled(row_chars, Style::default().fg(Color::Cyan))));
+    }
+
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 fn render_bottom(f: &mut Frame, app: &App, area: Rect) {

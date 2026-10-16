@@ -1,14 +1,24 @@
+use std::f32::consts::PI;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use anyhow::{bail, Result};
 use crossterm::event::KeyCode;
+use rustfft::{num_complex::Complex, Fft, FftPlanner};
 
 use crate::audio::Audio;
+
+const FFT_SIZE: usize = 2048;
+const NUM_BINS: usize = 64;
 
 pub struct App {
     pub audio: Audio,
     pub tracks: Vec<PathBuf>,
     pub idx: usize,
     pub quit: bool,
+    pub bins: Vec<f32>,
+    fft: Arc<dyn Fft<f32>>,
+    window: Vec<f32>,
+    fft_buf: Vec<Complex<f32>>,
 }
 
 impl App {
@@ -30,11 +40,23 @@ impl App {
             let _ = audio.load(&tracks[0]);
         }
 
+        let mut planner = FftPlanner::<f32>::new();
+        let fft = planner.plan_fft_forward(FFT_SIZE);
+        let window = (0..FFT_SIZE)
+            .map(|i| 0.5 * (1.0 - (2.0 * PI * i as f32 / (FFT_SIZE as f32 - 1.0)).cos()))
+            .collect();
+        let fft_buf = vec![Complex { re: 0.0, im: 0.0 }; FFT_SIZE];
+        let bins = vec![0.0; NUM_BINS];
+
         Ok(Self {
             audio,
             tracks,
             idx: 0,
             quit: false,
+            bins,
+            fft,
+            window,
+            fft_buf,
         })
     }
 
@@ -71,7 +93,75 @@ impl App {
                 self.audio.load(&self.tracks[self.idx])?;
             }
         }
+        self.update_fft();
         Ok(())
+    }
+
+    fn update_fft(&mut self) {
+        let decay = 0.035f32;
+
+        if self.audio.is_paused() || self.audio.is_empty() || self.tracks.is_empty() {
+            for b in &mut self.bins {
+                *b = (*b - decay).max(0.0);
+            }
+            return;
+        }
+
+        let samples: Vec<f32> = match self.audio.samples.try_lock() {
+            Ok(ring) if ring.len() >= FFT_SIZE => {
+                let skip = ring.len() - FFT_SIZE;
+                ring.iter().skip(skip).copied().collect()
+            }
+            _ => Vec::new(),
+        };
+
+        if samples.len() < FFT_SIZE {
+            for b in &mut self.bins {
+                *b = (*b - decay).max(0.0);
+            }
+            return;
+        }
+
+        for (i, (&s, &w)) in samples.iter().zip(self.window.iter()).enumerate() {
+            self.fft_buf[i] = Complex { re: s * w, im: 0.0 };
+        }
+        self.fft.process(&mut self.fft_buf);
+
+        let half = FFT_SIZE / 2;
+        let mags: Vec<f32> = self.fft_buf[..half]
+            .iter()
+            .map(|c| (c.re * c.re + c.im * c.im).sqrt() / FFT_SIZE as f32)
+            .collect();
+
+        let f_min = 25.0f32;
+        let f_max = 18000.0f32;
+        let nyq = 22050.0f32;
+
+        for b in 0..NUM_BINS {
+            let p0 = b as f32 / NUM_BINS as f32;
+            let p1 = (b + 1) as f32 / NUM_BINS as f32;
+            let f0 = f_min * (f_max / f_min).powf(p0);
+            let f1 = f_min * (f_max / f_min).powf(p1);
+
+            let i0 = ((f0 / nyq) * half as f32).floor() as usize;
+            let i1 = (((f1 / nyq) * half as f32).ceil() as usize).max(i0 + 1);
+
+            let start = i0.clamp(1, half - 1);
+            let end = i1.clamp(start + 1, half);
+
+            let sum: f32 = mags[start..end].iter().sum();
+            let avg = sum / (end - start) as f32;
+
+            let db = 20.0 * (avg * 4.0 + 1e-6).log10();
+            let norm = ((db + 48.0) / 48.0).clamp(0.0, 1.0);
+
+            let prev = self.bins[b];
+            self.bins[b] = if norm > prev {
+                norm
+            } else {
+                (prev - decay).max(norm).max(0.0)
+            };
+        }
     }
 
     pub fn track_name(&self) -> &str {

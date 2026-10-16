@@ -25,7 +25,7 @@ fn run(term: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<()> {
     while !app.quit {
         term.draw(|f| ui::render(f, app))?;
 
-        if event::poll(Duration::from_millis(50))? {
+        if event::poll(Duration::from_millis(16))? {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
                     app.handle_key(key.code)?;
