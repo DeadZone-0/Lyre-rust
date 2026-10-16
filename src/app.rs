@@ -8,9 +8,35 @@ use rustfft::{num_complex::Complex, Fft, FftPlanner};
 
 use crate::audio::Audio;
 use crate::lyrics::Lyrics;
+use crate::theme::{Theme, THEMES};
 
 const FFT_SIZE: usize = 2048;
 const NUM_BINS: usize = 64;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum VizMode {
+    Spectrum,
+    Oscilloscope,
+    CenterWave,
+}
+
+impl VizMode {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Spectrum => Self::Oscilloscope,
+            Self::Oscilloscope => Self::CenterWave,
+            Self::CenterWave => Self::Spectrum,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Spectrum => "Spectrum",
+            Self::Oscilloscope => "Oscilloscope",
+            Self::CenterWave => "Stereo Wave",
+        }
+    }
+}
 
 pub struct App {
     pub audio: Audio,
@@ -18,7 +44,12 @@ pub struct App {
     pub idx: usize,
     pub quit: bool,
     pub bins: Vec<f32>,
+    pub peaks: Vec<f32>,
+    pub bass_avg: f32,
+    pub pulse: f32,
     pub lyrics: Lyrics,
+    pub viz_mode: VizMode,
+    pub theme_idx: usize,
     fft: Arc<dyn Fft<f32>>,
     window: Vec<f32>,
     fft_buf: Vec<Complex<f32>>,
@@ -48,6 +79,7 @@ impl App {
             .collect();
         let fft_buf = vec![Complex { re: 0.0, im: 0.0 }; FFT_SIZE];
         let bins = vec![0.0; NUM_BINS];
+        let peaks = vec![0.0; NUM_BINS];
         let (lyrics_tx, lyrics_rx) = channel();
 
         let mut app = Self {
@@ -56,7 +88,12 @@ impl App {
             idx: 0,
             quit: false,
             bins,
+            peaks,
+            bass_avg: 0.0,
+            pulse: 0.0,
             lyrics: Lyrics::default(),
+            viz_mode: VizMode::Spectrum,
+            theme_idx: 0,
             fft,
             window,
             fft_buf,
@@ -69,6 +106,10 @@ impl App {
         }
 
         Ok(app)
+    }
+
+    pub fn theme(&self) -> &'static Theme {
+        &THEMES[self.theme_idx]
     }
 
     pub fn load_current(&mut self) -> Result<()> {
@@ -91,6 +132,8 @@ impl App {
             KeyCode::Char('q') => self.quit = true,
             KeyCode::Char(' ') => self.audio.toggle_pause(),
             KeyCode::Char('s') => self.skip()?,
+            KeyCode::Char('v') => self.viz_mode = self.viz_mode.next(),
+            KeyCode::Char('t') => self.theme_idx = (self.theme_idx + 1) % THEMES.len(),
             KeyCode::Char('+') | KeyCode::Char('=') => {
                 let v = self.audio.volume() + 0.05;
                 self.audio.set_volume(v);
@@ -130,13 +173,41 @@ impl App {
         Ok(())
     }
 
+    pub fn wave_samples(&self, count: usize) -> Vec<f32> {
+        match self.audio.samples.try_lock() {
+            Ok(ring) if ring.len() >= count => {
+                let skip = ring.len() - count;
+                ring.iter().skip(skip).copied().collect()
+            }
+            _ => vec![0.0; count],
+        }
+    }
+
+    pub fn stereo_samples(&self, count: usize) -> (Vec<f32>, Vec<f32>) {
+        match self.audio.stereo.try_lock() {
+            Ok(s) if s.0.len() >= count => {
+                let skip = s.0.len() - count;
+                (
+                    s.0.iter().skip(skip).copied().collect(),
+                    s.1.iter().skip(skip).copied().collect(),
+                )
+            }
+            _ => (vec![0.0; count], vec![0.0; count]),
+        }
+    }
+
     fn update_fft(&mut self) {
         let decay = 0.035f32;
+        let peak_decay = 0.008f32;
 
         if self.audio.is_paused() || self.audio.is_empty() || self.tracks.is_empty() {
             for b in &mut self.bins {
                 *b = (*b - decay).max(0.0);
             }
+            for p in &mut self.peaks {
+                *p = (*p - peak_decay * 2.0).max(0.0);
+            }
+            self.pulse = (self.pulse - 0.07).max(0.0);
             return;
         }
 
@@ -152,6 +223,10 @@ impl App {
             for b in &mut self.bins {
                 *b = (*b - decay).max(0.0);
             }
+            for p in &mut self.peaks {
+                *p = (*p - peak_decay * 2.0).max(0.0);
+            }
+            self.pulse = (self.pulse - 0.07).max(0.0);
             return;
         }
 
@@ -165,6 +240,13 @@ impl App {
             .iter()
             .map(|c| (c.re * c.re + c.im * c.im).sqrt() / FFT_SIZE as f32)
             .collect();
+
+        let bass_energy: f32 = mags[1..=6].iter().sum::<f32>() / 6.0;
+        if bass_energy > self.bass_avg * 1.35 && bass_energy > 0.012 {
+            self.pulse = 1.0;
+        }
+        self.bass_avg = self.bass_avg * 0.94 + bass_energy * 0.06;
+        self.pulse = (self.pulse - 0.07).max(0.0);
 
         let f_min = 25.0f32;
         let f_max = 18000.0f32;
@@ -193,6 +275,13 @@ impl App {
                 norm
             } else {
                 (prev - decay).max(norm).max(0.0)
+            };
+
+            let prev_peak = self.peaks[b];
+            self.peaks[b] = if norm > prev_peak {
+                norm
+            } else {
+                (prev_peak - peak_decay).max(0.0)
             };
         }
     }

@@ -1,6 +1,7 @@
 mod app;
 mod audio;
 mod lyrics;
+mod theme;
 mod ui;
 
 use std::env;

@@ -1,12 +1,17 @@
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
+    symbols::Marker,
     text::{Line, Span},
-    widgets::{Block, BorderType, Gauge, Paragraph},
+    widgets::{
+        canvas::{Canvas, Line as CanvasLine},
+        Block, BorderType, Gauge, Paragraph,
+    },
     Frame,
 };
 
-use crate::app::App;
+use crate::app::{App, VizMode};
+use crate::theme::blend;
 
 const BLOCKS: [char; 9] = [' ', ' ', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
 
@@ -26,6 +31,7 @@ pub fn render(f: &mut Frame, app: &App) {
 }
 
 fn render_top(f: &mut Frame, app: &App, area: Rect) {
+    let th = app.theme();
     let state = app.state_str();
     let name = app.track_name();
     let vol = (app.audio.volume() * 100.0).round() as u32;
@@ -36,15 +42,18 @@ fn render_top(f: &mut Frame, app: &App, area: Rect) {
     };
 
     let text = Line::from(vec![
-        Span::styled(format!("[{state}] "), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-        Span::raw(name),
-        Span::styled(track_num, Style::default().fg(Color::DarkGray)),
-        Span::raw(" | "),
-        Span::styled(format!("Vol: {vol}%"), Style::default().fg(Color::Gray)),
+        Span::styled(format!("[{state}] "), Style::default().fg(th.primary).add_modifier(Modifier::BOLD)),
+        Span::styled(name, Style::default().fg(th.text)),
+        Span::styled(track_num, Style::default().fg(th.dimmed)),
+        Span::styled(" | ", Style::default().fg(th.dimmed)),
+        Span::styled(format!("Vol: {vol}%"), Style::default().fg(th.text)),
+        Span::styled(" | ", Style::default().fg(th.dimmed)),
+        Span::styled(th.name, Style::default().fg(th.secondary)),
     ]);
 
     let block = Block::bordered()
         .border_type(BorderType::Plain)
+        .border_style(Style::default().fg(th.dimmed))
         .title("Player");
     f.render_widget(Paragraph::new(text).block(block), area);
 }
@@ -63,61 +72,134 @@ fn render_middle(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_visualizer(f: &mut Frame, app: &App, area: Rect) {
+    let th = app.theme();
+    let border_color = blend(th.dimmed, th.accent, app.pulse);
+    let title = format!("Visualizer [{}]", app.viz_mode.name());
     let block = Block::bordered()
         .border_type(BorderType::Plain)
-        .title("Visualizer");
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+        .border_style(Style::default().fg(border_color))
+        .title(title);
 
-    if inner.width == 0 || inner.height == 0 || app.bins.is_empty() {
-        return;
-    }
+    match app.viz_mode {
+        VizMode::Spectrum => {
+            let inner = block.inner(area);
+            f.render_widget(block, area);
+            if inner.width == 0 || inner.height == 0 || app.bins.is_empty() {
+                return;
+            }
 
-    let width = inner.width as usize;
-    let height = inner.height as usize;
-    let mut lines = Vec::with_capacity(height);
+            let width = inner.width as usize;
+            let height = inner.height as usize;
+            let mut lines = Vec::with_capacity(height);
 
-    for y in 0..height {
-        let row_from_bottom = height - 1 - y;
-        let min_level = row_from_bottom * 8;
-        let max_level = min_level + 8;
+            for y in 0..height {
+                let row_from_bottom = height - 1 - y;
+                let min_level = row_from_bottom * 8;
+                let max_level = min_level + 8;
 
-        let mut row_chars = String::with_capacity(width);
-        for x in 0..width {
-            let t = (x as f32 / width as f32) * (app.bins.len() - 1) as f32;
-            let i = t.floor() as usize;
-            let frac = t - i as f32;
-            let v = if i + 1 < app.bins.len() {
-                app.bins[i] * (1.0 - frac) + app.bins[i + 1] * frac
-            } else {
-                app.bins[i]
-            };
+                let mut row_spans = Vec::new();
+                let mut curr_str = String::new();
+                let mut curr_fg = th.primary;
 
-            let col_eighths = (v * (height * 8) as f32).round() as usize;
-            let ch = if col_eighths >= max_level {
-                '█'
-            } else if col_eighths <= min_level {
-                ' '
-            } else {
-                BLOCKS[col_eighths - min_level]
-            };
-            row_chars.push(ch);
+                for x in 0..width {
+                    let t = (x as f32 / width as f32) * (app.bins.len() - 1) as f32;
+                    let i = t.floor() as usize;
+                    let frac = t - i as f32;
+                    let v = if i + 1 < app.bins.len() {
+                        app.bins[i] * (1.0 - frac) + app.bins[i + 1] * frac
+                    } else {
+                        app.bins[i]
+                    };
+                    let p_val = if i + 1 < app.peaks.len() {
+                        app.peaks[i] * (1.0 - frac) + app.peaks[i + 1] * frac
+                    } else {
+                        app.peaks[i]
+                    };
+
+                    let col_eighths = (v * (height * 8) as f32).round() as usize;
+                    let peak_eighths = (p_val * (height * 8) as f32).round() as usize;
+                    let peak_row = peak_eighths / 8;
+
+                    let (ch, fg) = if col_eighths >= max_level {
+                        ('█', th.primary)
+                    } else if col_eighths > min_level {
+                        (BLOCKS[col_eighths - min_level], th.primary)
+                    } else if peak_row == row_from_bottom && peak_eighths > 0 {
+                        ('─', th.secondary)
+                    } else {
+                        (' ', th.primary)
+                    };
+
+                    if fg != curr_fg && !curr_str.is_empty() {
+                        row_spans.push(Span::styled(curr_str, Style::default().fg(curr_fg)));
+                        curr_str = String::new();
+                        curr_fg = fg;
+                    }
+                    curr_str.push(ch);
+                }
+                if !curr_str.is_empty() {
+                    row_spans.push(Span::styled(curr_str, Style::default().fg(curr_fg)));
+                }
+                lines.push(Line::from(row_spans));
+            }
+            f.render_widget(Paragraph::new(lines), inner);
         }
-        lines.push(Line::from(Span::styled(row_chars, Style::default().fg(Color::Cyan))));
-    }
+        VizMode::Oscilloscope => {
+            let samples = app.wave_samples(area.width as usize * 2);
+            let canvas = Canvas::default()
+                .block(block)
+                .marker(Marker::Braille)
+                .x_bounds([0.0, (samples.len().max(2) - 1) as f64])
+                .y_bounds([-1.0, 1.0])
+                .paint(|ctx| {
+                    ctx.draw(&CanvasLine::new(0.0, 0.0, samples.len() as f64, 0.0, th.dimmed));
+                    for i in 0..samples.len().saturating_sub(1) {
+                        ctx.draw(&CanvasLine::new(
+                            i as f64,
+                            samples[i] as f64,
+                            (i + 1) as f64,
+                            samples[i + 1] as f64,
+                            th.primary,
+                        ));
+                    }
+                });
+            f.render_widget(canvas, area);
+        }
+        VizMode::CenterWave => {
+            let (left, right) = app.stereo_samples(area.width as usize * 2);
+            let canvas = Canvas::default()
+                .block(block)
+                .marker(Marker::Braille)
+                .x_bounds([0.0, (left.len().max(2) - 1) as f64])
+                .y_bounds([-1.0, 1.0])
+                .paint(|ctx| {
+                    ctx.draw(&CanvasLine::new(0.0, 0.0, left.len() as f64, 0.0, th.dimmed));
+                    for i in 0..left.len().saturating_sub(1) {
+                        let l1 = (left[i].abs() as f64).clamp(0.0, 1.0);
+                        let l2 = (left[i + 1].abs() as f64).clamp(0.0, 1.0);
+                        ctx.draw(&CanvasLine::new(i as f64, l1, (i + 1) as f64, l2, th.primary));
 
-    f.render_widget(Paragraph::new(lines), inner);
+                        let r1 = -(right[i].abs() as f64).clamp(0.0, 1.0);
+                        let r2 = -(right[i + 1].abs() as f64).clamp(0.0, 1.0);
+                        ctx.draw(&CanvasLine::new(i as f64, r1, (i + 1) as f64, r2, th.secondary));
+                    }
+                });
+            f.render_widget(canvas, area);
+        }
+    }
 }
 
 fn render_lyrics(f: &mut Frame, app: &App, area: Rect) {
+    let th = app.theme();
     let title = if app.lyrics.offset_ms != 0 {
-        format!("Lyrics [{:+}ms]", app.lyrics.offset_ms)
+        format!("Lyrics [{:+}]", app.lyrics.offset_ms)
     } else {
         "Lyrics".to_string()
     };
 
     let block = Block::bordered()
         .border_type(BorderType::Plain)
+        .border_style(Style::default().fg(th.dimmed))
         .title(title);
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -127,7 +209,7 @@ fn render_lyrics(f: &mut Frame, app: &App, area: Rect) {
     }
 
     if app.lyrics.lines.is_empty() {
-        let msg = Line::from(Span::styled("No lyrics available", Style::default().fg(Color::DarkGray))).centered();
+        let msg = Line::from(Span::styled("No lyrics available", Style::default().fg(th.dimmed))).centered();
         let mid = inner.height / 2;
         let mut lines = vec![Line::raw(""); mid as usize];
         lines.push(msg);
@@ -147,9 +229,9 @@ fn render_lyrics(f: &mut Frame, app: &App, area: Rect) {
             let l = &app.lyrics.lines[line_idx as usize];
             let is_current = cur == Some(line_idx as usize);
             let style = if is_current {
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                Style::default().fg(th.secondary).add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::DarkGray)
+                Style::default().fg(th.dimmed)
             };
             lines.push(Line::from(Span::styled(&l.text, style)).centered());
         } else {
@@ -161,6 +243,7 @@ fn render_lyrics(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_bottom(f: &mut Frame, app: &App, area: Rect) {
+    let th = app.theme();
     let pos = app.audio.pos();
     let dur = app.audio.duration;
 
@@ -183,10 +266,15 @@ fn render_bottom(f: &mut Frame, app: &App, area: Rect) {
     };
 
     let gauge = Gauge::default()
-        .block(Block::bordered().border_type(BorderType::Plain).title("Progress"))
-        .gauge_style(Style::default().fg(Color::Cyan))
+        .block(
+            Block::bordered()
+                .border_type(BorderType::Plain)
+                .border_style(Style::default().fg(th.dimmed))
+                .title("Progress"),
+        )
+        .gauge_style(Style::default().fg(th.primary))
         .ratio(ratio)
-        .label(label);
+        .label(Span::styled(label, Style::default().fg(th.text)));
 
     f.render_widget(gauge, area);
 }

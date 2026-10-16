@@ -16,6 +16,7 @@ pub struct Audio {
     pub path: Option<PathBuf>,
     pub duration: Option<Duration>,
     pub samples: Arc<Mutex<VecDeque<f32>>>,
+    pub stereo: Arc<Mutex<(VecDeque<f32>, VecDeque<f32>)>>,
 }
 
 impl Audio {
@@ -31,6 +32,10 @@ impl Audio {
             path: None,
             duration: None,
             samples: Arc::new(Mutex::new(VecDeque::with_capacity(4096))),
+            stereo: Arc::new(Mutex::new((
+                VecDeque::with_capacity(2048),
+                VecDeque::with_capacity(2048),
+            ))),
         })
     }
 
@@ -46,12 +51,20 @@ impl Audio {
             channels,
             chan_idx: 0,
             frame_acc: 0.0,
+            left_sample: 0.0,
+            right_sample: 0.0,
             ring: Arc::clone(&self.samples),
+            stereo_ring: Arc::clone(&self.stereo),
             buf: Vec::with_capacity(64),
+            stereo_buf: (Vec::with_capacity(64), Vec::with_capacity(64)),
         };
 
         if let Ok(mut ring) = self.samples.lock() {
             ring.clear();
+        }
+        if let Ok(mut s_ring) = self.stereo.lock() {
+            s_ring.0.clear();
+            s_ring.1.clear();
         }
 
         self.sink.clear();
@@ -97,8 +110,12 @@ struct SampleTap<S> {
     channels: usize,
     chan_idx: usize,
     frame_acc: f32,
+    left_sample: f32,
+    right_sample: f32,
     ring: Arc<Mutex<VecDeque<f32>>>,
+    stereo_ring: Arc<Mutex<(VecDeque<f32>, VecDeque<f32>)>>,
     buf: Vec<f32>,
+    stereo_buf: (Vec<f32>, Vec<f32>),
 }
 
 impl<S: Source> Iterator for SampleTap<S> {
@@ -106,6 +123,15 @@ impl<S: Source> Iterator for SampleTap<S> {
 
     fn next(&mut self) -> Option<Self::Item> {
         let sample = self.input.next()?;
+        if self.chan_idx == 0 {
+            self.left_sample = sample;
+            if self.channels == 1 {
+                self.right_sample = sample;
+            }
+        } else if self.chan_idx == 1 {
+            self.right_sample = sample;
+        }
+
         self.frame_acc += sample;
         self.chan_idx += 1;
         if self.chan_idx >= self.channels {
@@ -113,6 +139,9 @@ impl<S: Source> Iterator for SampleTap<S> {
             self.chan_idx = 0;
             self.frame_acc = 0.0;
             self.buf.push(mono);
+            self.stereo_buf.0.push(self.left_sample);
+            self.stereo_buf.1.push(self.right_sample);
+
             if self.buf.len() >= 64 {
                 if let Ok(mut ring) = self.ring.try_lock() {
                     for &s in &self.buf {
@@ -122,7 +151,19 @@ impl<S: Source> Iterator for SampleTap<S> {
                         ring.push_back(s);
                     }
                 }
+                if let Ok(mut s_ring) = self.stereo_ring.try_lock() {
+                    for i in 0..self.stereo_buf.0.len() {
+                        if s_ring.0.len() >= 2048 {
+                            s_ring.0.pop_front();
+                            s_ring.1.pop_front();
+                        }
+                        s_ring.0.push_back(self.stereo_buf.0[i]);
+                        s_ring.1.push_back(self.stereo_buf.1[i]);
+                    }
+                }
                 self.buf.clear();
+                self.stereo_buf.0.clear();
+                self.stereo_buf.1.clear();
             }
         }
         Some(sample)
