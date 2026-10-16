@@ -59,11 +59,7 @@ fn render_middle(f: &mut Frame, app: &App, area: Rect) {
         .split(area);
 
     render_visualizer(f, app, chunks[0]);
-
-    let lyrics_block = Block::bordered()
-        .border_type(BorderType::Plain)
-        .title("Lyrics");
-    f.render_widget(lyrics_block, chunks[1]);
+    render_lyrics(f, app, chunks[1]);
 }
 
 fn render_visualizer(f: &mut Frame, app: &App, area: Rect) {
@@ -108,6 +104,57 @@ fn render_visualizer(f: &mut Frame, app: &App, area: Rect) {
             row_chars.push(ch);
         }
         lines.push(Line::from(Span::styled(row_chars, Style::default().fg(Color::Cyan))));
+    }
+
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+fn render_lyrics(f: &mut Frame, app: &App, area: Rect) {
+    let title = if app.lyrics.offset_ms != 0 {
+        format!("Lyrics [{:+}ms]", app.lyrics.offset_ms)
+    } else {
+        "Lyrics".to_string()
+    };
+
+    let block = Block::bordered()
+        .border_type(BorderType::Plain)
+        .title(title);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    if app.lyrics.lines.is_empty() {
+        let msg = Line::from(Span::styled("No lyrics available", Style::default().fg(Color::DarkGray))).centered();
+        let mid = inner.height / 2;
+        let mut lines = vec![Line::raw(""); mid as usize];
+        lines.push(msg);
+        f.render_widget(Paragraph::new(lines), inner);
+        return;
+    }
+
+    let pos = app.audio.pos();
+    let cur = app.lyrics.current_index(pos);
+    let center_idx = cur.unwrap_or(0) as i32;
+    let mid_y = inner.height as i32 / 2;
+    let mut lines = Vec::with_capacity(inner.height as usize);
+
+    for y in 0..inner.height as i32 {
+        let line_idx = center_idx + (y - mid_y);
+        if line_idx >= 0 && (line_idx as usize) < app.lyrics.lines.len() {
+            let l = &app.lyrics.lines[line_idx as usize];
+            let is_current = cur == Some(line_idx as usize);
+            let style = if is_current {
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            lines.push(Line::from(Span::styled(&l.text, style)).centered());
+        } else {
+            lines.push(Line::raw(""));
+        }
     }
 
     f.render_widget(Paragraph::new(lines), inner);

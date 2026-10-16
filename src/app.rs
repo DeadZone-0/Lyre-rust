@@ -1,11 +1,13 @@
 use std::f32::consts::PI;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 use anyhow::{bail, Result};
 use crossterm::event::KeyCode;
 use rustfft::{num_complex::Complex, Fft, FftPlanner};
 
 use crate::audio::Audio;
+use crate::lyrics::Lyrics;
 
 const FFT_SIZE: usize = 2048;
 const NUM_BINS: usize = 64;
@@ -16,14 +18,17 @@ pub struct App {
     pub idx: usize,
     pub quit: bool,
     pub bins: Vec<f32>,
+    pub lyrics: Lyrics,
     fft: Arc<dyn Fft<f32>>,
     window: Vec<f32>,
     fft_buf: Vec<Complex<f32>>,
+    lyrics_tx: Sender<Lyrics>,
+    lyrics_rx: Receiver<Lyrics>,
 }
 
 impl App {
     pub fn new(target: Option<PathBuf>) -> Result<Self> {
-        let mut audio = Audio::new()?;
+        let audio = Audio::new()?;
         let mut tracks = Vec::new();
 
         if let Some(p) = target {
@@ -36,10 +41,6 @@ impl App {
             }
         }
 
-        if !tracks.is_empty() {
-            let _ = audio.load(&tracks[0]);
-        }
-
         let mut planner = FftPlanner::<f32>::new();
         let fft = planner.plan_fft_forward(FFT_SIZE);
         let window = (0..FFT_SIZE)
@@ -47,17 +48,42 @@ impl App {
             .collect();
         let fft_buf = vec![Complex { re: 0.0, im: 0.0 }; FFT_SIZE];
         let bins = vec![0.0; NUM_BINS];
+        let (lyrics_tx, lyrics_rx) = channel();
 
-        Ok(Self {
+        let mut app = Self {
             audio,
             tracks,
             idx: 0,
             quit: false,
             bins,
+            lyrics: Lyrics::default(),
             fft,
             window,
             fft_buf,
-        })
+            lyrics_tx,
+            lyrics_rx,
+        };
+
+        if !app.tracks.is_empty() {
+            let _ = app.load_current();
+        }
+
+        Ok(app)
+    }
+
+    pub fn load_current(&mut self) -> Result<()> {
+        if self.tracks.is_empty() {
+            return Ok(());
+        }
+        let p = self.tracks[self.idx].clone();
+        self.audio.load(&p)?;
+        self.lyrics = Lyrics::default();
+        let tx = self.lyrics_tx.clone();
+        std::thread::spawn(move || {
+            let lrc = Lyrics::load(&p);
+            let _ = tx.send(lrc);
+        });
+        Ok(())
     }
 
     pub fn handle_key(&mut self, code: KeyCode) -> Result<()> {
@@ -73,6 +99,8 @@ impl App {
                 let v = self.audio.volume() - 0.05;
                 self.audio.set_volume(v);
             }
+            KeyCode::Char('[') => self.lyrics.offset_ms -= 100,
+            KeyCode::Char(']') => self.lyrics.offset_ms += 100,
             _ => {}
         }
         Ok(())
@@ -83,16 +111,21 @@ impl App {
             return Ok(());
         }
         self.idx = (self.idx + 1) % self.tracks.len();
-        self.audio.load(&self.tracks[self.idx])
+        self.load_current()
     }
 
     pub fn tick(&mut self) -> Result<()> {
         if !self.tracks.is_empty() && self.audio.is_empty() && !self.audio.is_paused() {
             if self.idx + 1 < self.tracks.len() {
                 self.idx += 1;
-                self.audio.load(&self.tracks[self.idx])?;
+                self.load_current()?;
             }
         }
+
+        while let Ok(lrc) = self.lyrics_rx.try_recv() {
+            self.lyrics = lrc;
+        }
+
         self.update_fft();
         Ok(())
     }
