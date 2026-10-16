@@ -7,6 +7,7 @@ edition = "2024"
 anyhow = "1.0.104"
 cpal = "0.18.2"
 crossterm = "0.29.0"
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp"] }
 lofty = "0.25.4"
 mpris = "2.1.0"
 ratatui = "0.30.2"

@@ -103,7 +103,7 @@ fn render_middle(f: &mut Frame, app: &App, area: Rect) {
 
         render_sidebar(f, app, chunks[0]);
         render_visualizer(f, app, chunks[1]);
-        render_lyrics(f, app, chunks[2]);
+        render_right_pane(f, app, chunks[2]);
     } else {
         let chunks = Layout::default()
             .direction(Direction::Horizontal)
@@ -114,8 +114,176 @@ fn render_middle(f: &mut Frame, app: &App, area: Rect) {
             .split(area);
 
         render_visualizer(f, app, chunks[0]);
-        render_lyrics(f, app, chunks[1]);
+        render_right_pane(f, app, chunks[1]);
     }
+}
+
+fn render_right_pane(f: &mut Frame, app: &App, area: Rect) {
+    if !app.show_art || area.height < 8 {
+        render_lyrics(f, app, area);
+        return;
+    }
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage(50),
+            Constraint::Percentage(50),
+        ])
+        .split(area);
+
+    render_album_art(f, app, chunks[0]);
+    render_lyrics(f, app, chunks[1]);
+}
+
+fn render_album_art(f: &mut Frame, app: &App, area: Rect) {
+    let th = app.theme();
+    let mode_tag = if app.is_kitty && app.use_kitty_art {
+        "Kitty"
+    } else {
+        "Pixel"
+    };
+    let block = Block::bordered()
+        .border_type(BorderType::Plain)
+        .border_style(Style::default().fg(th.dimmed))
+        .title(format!("Cover [{mode_tag}]"));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if inner.width < 4 || inner.height < 2 {
+        return;
+    }
+
+    let max_cols = inner.width as usize;
+    let max_rows = inner.height as usize;
+    let mut s = max_cols.min(max_rows * 2);
+    s &= !1;
+    if s < 2 {
+        return;
+    }
+
+    let cols = s as u16;
+    let rows = (s / 2) as u16;
+    let pad_x = (inner.width.saturating_sub(cols)) / 2;
+    let pad_y = (inner.height.saturating_sub(rows)) / 2;
+    let art_rect = Rect {
+        x: inner.x + pad_x,
+        y: inner.y + pad_y,
+        width: cols,
+        height: rows,
+    };
+
+    let has_image = app.cover.png.is_some() && app.cover.rgb.is_some();
+    if app.is_kitty && app.use_kitty_art && has_image {
+        let prev = app.art_rect.get();
+        let cur = art_rect.into();
+        if prev != cur {
+            app.art_rect.set(cur);
+            app.kitty_needs_draw.set(true);
+        }
+        return;
+    }
+
+    let resized = app.cover.rgb.as_ref().map(|rgb| {
+        image::imageops::resize(
+            rgb,
+            cols as u32,
+            (rows * 2) as u32,
+            image::imageops::FilterType::Triangle,
+        )
+    });
+
+    let cx = cols as f32 / 2.0;
+    let cy = rows as f32;
+    let disc_r = cx.min(cy) - 0.5;
+
+    let h = inner.height as usize;
+    let mut lines = Vec::with_capacity(h);
+
+    for y in 0..h {
+        let py = y as u16;
+        if py < pad_y || py >= pad_y + rows {
+            lines.push(Line::raw(""));
+            continue;
+        }
+
+        let r = (py - pad_y) as usize;
+        let mut row_spans = Vec::new();
+        if pad_x > 0 {
+            row_spans.push(Span::raw(" ".repeat(pad_x as usize)));
+        }
+
+        let y_top = (r * 2) as u32;
+        let y_bot = (r * 2 + 1) as u32;
+
+        for c in 0..cols as usize {
+            if resized.is_some() {
+                let img = resized.as_ref().unwrap();
+                let top = img.get_pixel(c as u32, y_top);
+                let bot = img.get_pixel(c as u32, y_bot);
+                let fg = ratatui::style::Color::Rgb(top[0], top[1], top[2]);
+                let bg = ratatui::style::Color::Rgb(bot[0], bot[1], bot[2]);
+                row_spans.push(Span::styled("▀", Style::default().fg(fg).bg(bg)));
+            } else {
+                let top_col = vinyl_pixel(c as f32, y_top as f32, cx, cy, disc_r, th);
+                let bot_col = vinyl_pixel(c as f32, y_bot as f32, cx, cy, disc_r, th);
+
+                if top_col.is_some() && bot_col.is_some() {
+                    let fg = top_col.unwrap();
+                    let bg = bot_col.unwrap();
+                    row_spans.push(Span::styled("▀", Style::default().fg(fg).bg(bg)));
+                } else if top_col.is_some() {
+                    let fg = top_col.unwrap();
+                    row_spans.push(Span::styled("▀", Style::default().fg(fg)));
+                } else if bot_col.is_some() {
+                    let fg = bot_col.unwrap();
+                    row_spans.push(Span::styled("▄", Style::default().fg(fg)));
+                } else {
+                    row_spans.push(Span::raw(" "));
+                }
+            }
+        }
+
+        if pad_x > 0 {
+            row_spans.push(Span::raw(" ".repeat(pad_x as usize)));
+        }
+        lines.push(Line::from(row_spans));
+    }
+
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+fn vinyl_pixel(
+    x: f32,
+    y: f32,
+    cx: f32,
+    cy: f32,
+    r: f32,
+    th: &crate::theme::Theme,
+) -> Option<ratatui::style::Color> {
+    let dx = x - cx;
+    let dy = y - cy;
+    let d = (dx * dx + dy * dy).sqrt();
+    if d > r {
+        return None;
+    }
+    if d <= 1.5 {
+        return ratatui::style::Color::Rgb(16, 16, 18).into();
+    }
+    if d <= r * 0.38 {
+        let ring = (d * 1.5) as usize;
+        if ring % 2 == 0 {
+            return th.accent.into();
+        } else {
+            return th.primary.into();
+        }
+    }
+    let groove = ((d * 2.5).sin() * 5.0) as i16;
+    let angle = dy.atan2(dx);
+    let sheen = ((angle * 2.0).sin().abs().powf(4.0) * 24.0) as i16;
+    let base = 28 + groove + sheen;
+    let v = base.clamp(16, 85) as u8;
+    ratatui::style::Color::Rgb(v, v, (v as f32 * 1.08).min(255.0) as u8).into()
 }
 
 fn render_sidebar(f: &mut Frame, app: &App, area: Rect) {
@@ -406,7 +574,7 @@ fn render_lyrics(f: &mut Frame, app: &App, area: Rect) {
         let line_idx = center_idx + (y - mid_y);
         if line_idx >= 0 && (line_idx as usize) < app.lyrics.lines.len() {
             let l = &app.lyrics.lines[line_idx as usize];
-            let is_current = cur == Some(line_idx as usize);
+            let is_current = cur.unwrap_or(usize::MAX) == line_idx as usize;
             let style = if is_current {
                 Style::default().fg(th.secondary).add_modifier(Modifier::BOLD)
             } else {
@@ -426,22 +594,21 @@ fn render_bottom(f: &mut Frame, app: &App, area: Rect) {
     let pos = app.current_pos();
     let dur = app.current_duration();
 
-    let (ratio, label) = match dur {
-        Some(d) if d.as_secs() > 0 => {
-            let r = (pos.as_secs_f64() / d.as_secs_f64()).clamp(0.0, 1.0);
-            let lbl = format!(
-                "{:02}:{:02} / {:02}:{:02}",
-                pos.as_secs() / 60,
-                pos.as_secs() % 60,
-                d.as_secs() / 60,
-                d.as_secs() % 60
-            );
-            (r, lbl)
-        }
-        _ => {
-            let lbl = format!("{:02}:{:02} / --:--", pos.as_secs() / 60, pos.as_secs() % 60);
-            (0.0, lbl)
-        }
+    let dur_secs = dur.unwrap_or_default().as_secs();
+    let (ratio, label) = if dur_secs > 0 {
+        let d = dur.unwrap();
+        let r = (pos.as_secs_f64() / d.as_secs_f64()).clamp(0.0, 1.0);
+        let lbl = format!(
+            "{:02}:{:02} / {:02}:{:02}",
+            pos.as_secs() / 60,
+            pos.as_secs() % 60,
+            d.as_secs() / 60,
+            d.as_secs() % 60
+        );
+        (r, lbl)
+    } else {
+        let lbl = format!("{:02}:{:02} / --:--", pos.as_secs() / 60, pos.as_secs() % 60);
+        (0.0, lbl)
     };
 
     let gauge = Gauge::default()
@@ -462,7 +629,7 @@ fn render_help(f: &mut Frame, app: &App) {
     let th = app.theme();
     let area = f.area();
     let w = 48.min(area.width);
-    let h = 17.min(area.height);
+    let h = 18.min(area.height);
     let rect = Rect {
         x: area.x + (area.width.saturating_sub(w)) / 2,
         y: area.y + (area.height.saturating_sub(h)) / 2,
@@ -477,6 +644,7 @@ fn render_help(f: &mut Frame, app: &App) {
         ("n / b", "Next / Prev Track"),
         ("s", "Restart / Skip"),
         ("m", "Toggle Local / System Mode"),
+        ("c", "Toggle Cover Art"),
         ("+ / -", "Volume Up / Down"),
         ("[ / ]", "Lyrics Offset (-/+100ms)"),
         ("v", "Visualizer Mode"),

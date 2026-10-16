@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::f32::consts::PI;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -5,9 +6,11 @@ use std::sync::Arc;
 use std::time::Duration;
 use anyhow::{anyhow, Result};
 use crossterm::event::KeyCode;
+use ratatui::layout::Rect;
 use rustfft::{num_complex::Complex, Fft, FftPlanner};
 
 use crate::audio::Audio;
+use crate::cover::{self, CoverArt};
 use crate::lyrics::Lyrics;
 use crate::mpris_sync;
 use crate::theme::{Theme, THEMES};
@@ -44,7 +47,7 @@ impl VizMode {
 
     pub fn name(self) -> &'static str {
         if self == Self::Bars {
-            "CAVA Bars"
+            "Bars"
         } else if self == Self::Spectrum {
             "Spectrum"
         } else if self == Self::Oscilloscope {
@@ -62,6 +65,7 @@ pub struct App {
     pub mpris_title: String,
     pub mpris_artist: String,
     pub mpris_player: String,
+    pub mpris_art_url: String,
     pub mpris_pos: Duration,
     pub mpris_len: Duration,
     pub mpris_playing: bool,
@@ -71,6 +75,12 @@ pub struct App {
     pub show_sidebar: bool,
     pub show_help: bool,
     pub quit: bool,
+    pub cover: CoverArt,
+    pub show_art: bool,
+    pub use_kitty_art: bool,
+    pub is_kitty: bool,
+    pub kitty_needs_draw: Cell<bool>,
+    pub art_rect: Cell<Option<Rect>>,
     pub bins: Vec<f32>,
     pub peaks: Vec<f32>,
     pub bass_avg: f32,
@@ -80,18 +90,22 @@ pub struct App {
     pub theme_idx: usize,
     last_mpris_title: String,
     last_mpris_artist: String,
+    last_mpris_art_url: String,
     mpris_tick: u8,
     fft: Arc<dyn Fft<f32>>,
     window: Vec<f32>,
     fft_buf: Vec<Complex<f32>>,
     lyrics_tx: Sender<Lyrics>,
     lyrics_rx: Receiver<Lyrics>,
+    cover_tx: Sender<Option<CoverArt>>,
+    cover_rx: Receiver<Option<CoverArt>>,
 }
 
 impl App {
     pub fn new(target: Option<&str>) -> Result<Self> {
         let audio = Audio::new()?;
-        let (tracks, start_idx, initial_mode) = if let Some(arg) = target {
+        let (tracks, start_idx, initial_mode) = if target.is_some() {
+            let arg = target.unwrap();
             if arg == "--system" || arg == "-s" {
                 let list = collect_tracks(Path::new(".")).unwrap_or_default();
                 (list, 0, AppMode::System)
@@ -127,6 +141,9 @@ impl App {
             (list, 0, AppMode::System)
         };
 
+        let is_kitty = cover::is_kitty();
+        let (cover_tx, cover_rx) = channel();
+
         let mut planner = FftPlanner::<f32>::new();
         let fft = planner.plan_fft_forward(FFT_SIZE);
         let mut window = Vec::with_capacity(FFT_SIZE);
@@ -147,6 +164,7 @@ impl App {
             mpris_title: String::new(),
             mpris_artist: String::new(),
             mpris_player: String::new(),
+            mpris_art_url: String::new(),
             mpris_pos: Duration::ZERO,
             mpris_len: Duration::ZERO,
             mpris_playing: false,
@@ -156,6 +174,12 @@ impl App {
             show_sidebar: false,
             show_help: false,
             quit: false,
+            cover: CoverArt::default(),
+            show_art: true,
+            use_kitty_art: is_kitty,
+            is_kitty,
+            kitty_needs_draw: Cell::new(true),
+            art_rect: Cell::new(None),
             bins,
             peaks,
             bass_avg: 0.0,
@@ -165,12 +189,15 @@ impl App {
             theme_idx: 0,
             last_mpris_title: String::new(),
             last_mpris_artist: String::new(),
+            last_mpris_art_url: String::new(),
             mpris_tick: 0,
             fft,
             window,
             fft_buf,
             lyrics_tx,
             lyrics_rx,
+            cover_tx,
+            cover_rx,
         };
 
         if app.mode == AppMode::System {
@@ -194,6 +221,11 @@ impl App {
                 self.audio.pause();
             }
             let _ = self.audio.start_capture();
+            self.cover = CoverArt::default();
+            if self.is_kitty {
+                cover::clear_kitty_image();
+            }
+            self.kitty_needs_draw.set(true);
             self.poll_mpris_immediate();
         } else {
             self.mode = AppMode::Local;
@@ -202,14 +234,48 @@ impl App {
                 self.audio.play();
             }
             self.lyrics = Lyrics::default();
+            self.cover = CoverArt::default();
+            if self.is_kitty {
+                cover::clear_kitty_image();
+            }
+            self.kitty_needs_draw.set(true);
             if !self.tracks.is_empty() {
                 let p = self.tracks[self.idx].clone();
                 let tx = self.lyrics_tx.clone();
+                let p_lyric = p.clone();
                 std::thread::spawn(move || {
-                    let lrc = Lyrics::load(&p);
+                    let lrc = Lyrics::load(&p_lyric);
                     let _ = tx.send(lrc);
                 });
+                self.spawn_cover_fetch(p.into(), None);
             }
+        }
+    }
+
+    fn spawn_cover_fetch(&self, path: Option<PathBuf>, url: Option<String>) {
+        let tx = self.cover_tx.clone();
+        std::thread::spawn(move || {
+            let bytes = cover::extract_cover(path.as_deref(), url.as_deref());
+            let art = bytes.and_then(|b| cover::load_cover(&b));
+            let _ = tx.send(art);
+        });
+    }
+
+    pub fn toggle_art(&mut self) {
+        if self.is_kitty {
+            if self.show_art && self.use_kitty_art {
+                self.use_kitty_art = false;
+                cover::clear_kitty_image();
+            } else if self.show_art && !self.use_kitty_art {
+                self.show_art = false;
+                cover::clear_kitty_image();
+            } else {
+                self.show_art = true;
+                self.use_kitty_art = true;
+                self.kitty_needs_draw.set(true);
+            }
+        } else {
+            self.show_art = !self.show_art;
         }
     }
 
@@ -218,6 +284,7 @@ impl App {
             &mut self.mpris_title,
             &mut self.mpris_artist,
             &mut self.mpris_player,
+            &mut self.mpris_art_url,
             &mut self.mpris_pos,
             &mut self.mpris_len,
             &mut self.mpris_playing,
@@ -225,25 +292,43 @@ impl App {
         self.mpris_active = active;
 
         if active {
-            if self.mpris_title != self.last_mpris_title || self.mpris_artist != self.last_mpris_artist {
+            let changed = self.mpris_title != self.last_mpris_title
+                || self.mpris_artist != self.last_mpris_artist
+                || self.mpris_art_url != self.last_mpris_art_url;
+            if changed {
                 self.last_mpris_title = self.mpris_title.clone();
                 self.last_mpris_artist = self.mpris_artist.clone();
+                self.last_mpris_art_url = self.mpris_art_url.clone();
                 self.lyrics = Lyrics::default();
+                self.cover = CoverArt::default();
+                if self.is_kitty {
+                    cover::clear_kitty_image();
+                }
+                self.kitty_needs_draw.set(true);
+
                 let title = self.mpris_title.clone();
                 let artist = if self.mpris_artist.is_empty() {
                     None
                 } else {
-                    Some(self.mpris_artist.clone())
+                    self.mpris_artist.clone().into()
                 };
                 let tx = self.lyrics_tx.clone();
                 std::thread::spawn(move || {
                     let lrc = Lyrics::load_cached(&title, artist.as_deref());
                     let _ = tx.send(lrc);
                 });
+
+                let url = if self.mpris_art_url.is_empty() {
+                    None
+                } else {
+                    self.mpris_art_url.clone().into()
+                };
+                self.spawn_cover_fetch(None, url);
             }
         } else {
             self.last_mpris_title.clear();
             self.last_mpris_artist.clear();
+            self.last_mpris_art_url.clear();
         }
     }
 
@@ -258,7 +343,7 @@ impl App {
     pub fn current_duration(&self) -> Option<Duration> {
         if self.mode == AppMode::System {
             if self.mpris_active && !self.mpris_len.is_zero() {
-                Some(self.mpris_len)
+                self.mpris_len.into()
             } else {
                 None
             }
@@ -274,11 +359,20 @@ impl App {
         let p = self.tracks[self.idx].clone();
         self.audio.load(&p)?;
         self.lyrics = Lyrics::default();
+        self.cover = CoverArt::default();
+        if self.is_kitty {
+            cover::clear_kitty_image();
+        }
+        self.kitty_needs_draw.set(true);
+
         let tx = self.lyrics_tx.clone();
+        let p_lyric = p.clone();
         std::thread::spawn(move || {
-            let lrc = Lyrics::load(&p);
+            let lrc = Lyrics::load(&p_lyric);
             let _ = tx.send(lrc);
         });
+
+        self.spawn_cover_fetch(p.into(), None);
         Ok(())
     }
 
@@ -300,6 +394,7 @@ impl App {
             }
             KeyCode::Char('?') => self.show_help = !self.show_help,
             KeyCode::Char('m') => self.toggle_mode(),
+            KeyCode::Char('c') => self.toggle_art(),
             KeyCode::Tab | KeyCode::Char('p') => {
                 self.show_sidebar = !self.show_sidebar;
                 if self.show_sidebar {
@@ -408,8 +503,12 @@ impl App {
             }
         }
 
-        while let Ok(lrc) = self.lyrics_rx.try_recv() {
+        for lrc in self.lyrics_rx.try_iter() {
             self.lyrics = lrc;
+        }
+        for art in self.cover_rx.try_iter() {
+            self.cover = art.unwrap_or_default();
+            self.kitty_needs_draw.set(true);
         }
 
         self.update_fft();
@@ -418,7 +517,9 @@ impl App {
 
     pub fn wave_samples(&self, count: usize) -> Vec<f32> {
         let mut out = vec![0.0; count];
-        if let Ok(ring) = self.audio.samples.try_lock() {
+        let lock = self.audio.samples.try_lock();
+        if lock.is_ok() {
+            let ring = lock.unwrap();
             let len = ring.len();
             if len >= count {
                 let offset = len - count;
@@ -433,7 +534,9 @@ impl App {
     pub fn stereo_samples(&self, count: usize) -> (Vec<f32>, Vec<f32>) {
         let mut left = vec![0.0; count];
         let mut right = vec![0.0; count];
-        if let Ok(s) = self.audio.stereo.try_lock() {
+        let lock = self.audio.stereo.try_lock();
+        if lock.is_ok() {
+            let s = lock.unwrap();
             let len = s.0.len();
             if len >= count {
                 let offset = len - count;
@@ -574,11 +677,15 @@ impl App {
     }
 
     pub fn track_name(&self) -> &str {
-        if let Some(p) = self.tracks.get(self.idx) {
-            p.file_name().and_then(|n| n.to_str()).unwrap_or("No track loaded")
-        } else {
-            "No track loaded"
+        let opt_p = self.tracks.get(self.idx);
+        if opt_p.is_some() {
+            let p = opt_p.unwrap();
+            let opt_n = p.file_name().and_then(|n| n.to_str());
+            if opt_n.is_some() {
+                return opt_n.unwrap();
+            }
         }
+        "No track loaded"
     }
 
     pub fn state_str(&self) -> &'static str {
@@ -619,10 +726,7 @@ fn collect_tracks(target: &Path) -> Result<Vec<PathBuf>> {
 }
 
 fn is_audio(p: &Path) -> bool {
-    if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
-        let ext = ext.to_ascii_lowercase();
-        ext == "mp3" || ext == "wav" || ext == "flac"
-    } else {
-        false
-    }
+    let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
+    let lower = ext.to_ascii_lowercase();
+    lower == "mp3" || lower == "wav" || lower == "flac"
 }

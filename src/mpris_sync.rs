@@ -5,17 +5,19 @@ pub fn poll(
     title: &mut String,
     artist: &mut String,
     player: &mut String,
+    art_url: &mut String,
     pos: &mut Duration,
     len: &mut Duration,
     playing: &mut bool,
 ) -> bool {
-    read_state(title, artist, player, pos, len, playing).is_some()
+    read_state(title, artist, player, art_url, pos, len, playing).is_some()
 }
 
 fn read_state(
     title: &mut String,
     artist: &mut String,
     player: &mut String,
+    art_url: &mut String,
     pos: &mut Duration,
     len: &mut Duration,
     playing: &mut bool,
@@ -32,6 +34,9 @@ fn read_state(
 
     player.clear();
     player.push_str(p.identity());
+
+    art_url.clear();
+    meta.art_url().map(|u| art_url.push_str(u));
 
     *pos = p.get_position().unwrap_or_default();
     *len = meta.length().unwrap_or_default();
