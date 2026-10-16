@@ -1,3 +1,5 @@
+
+
 # lyre
 
 lyre is a terminal music player and audio spectrum visualizer written in Rust. It plays local tracks or monitors active system audio via MPRIS D-Bus, syncs LRC lyrics, and renders album art with Kitty graphics or half-block pixel art.
@@ -5,9 +7,12 @@ lyre is a terminal music player and audio spectrum visualizer written in Rust. I
 ## Demos
 
 ### Demo 1
+https://github.com/user-attachments/assets/5cf494fb-72ee-4e29-a0e4-718e09f91ac4
+
 
 
 ### Demo 2
+https://github.com/user-attachments/assets/69c04bfb-d7f4-4200-b81a-05351dc9c146
 
 
 ## Installation
