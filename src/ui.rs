@@ -5,7 +5,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{
         canvas::{Canvas, Line as CanvasLine},
-        Block, BorderType, Gauge, Paragraph,
+        Block, BorderType, Clear, Gauge, Paragraph,
     },
     Frame,
 };
@@ -28,6 +28,10 @@ pub fn render(f: &mut Frame, app: &App) {
     render_top(f, app, chunks[0]);
     render_middle(f, app, chunks[1]);
     render_bottom(f, app, chunks[2]);
+
+    if app.show_help {
+        render_help(f, app);
+    }
 }
 
 fn render_top(f: &mut Frame, app: &App, area: Rect) {
@@ -59,16 +63,87 @@ fn render_top(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_middle(f: &mut Frame, app: &App, area: Rect) {
-    let chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(60),
-            Constraint::Percentage(40),
-        ])
-        .split(area);
+    if app.show_sidebar {
+        let chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(28),
+                Constraint::Percentage(44),
+                Constraint::Percentage(28),
+            ])
+            .split(area);
 
-    render_visualizer(f, app, chunks[0]);
-    render_lyrics(f, app, chunks[1]);
+        render_sidebar(f, app, chunks[0]);
+        render_visualizer(f, app, chunks[1]);
+        render_lyrics(f, app, chunks[2]);
+    } else {
+        let chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(60),
+                Constraint::Percentage(40),
+            ])
+            .split(area);
+
+        render_visualizer(f, app, chunks[0]);
+        render_lyrics(f, app, chunks[1]);
+    }
+}
+
+fn render_sidebar(f: &mut Frame, app: &App, area: Rect) {
+    let th = app.theme();
+    let block = Block::bordered()
+        .border_type(BorderType::Plain)
+        .border_style(Style::default().fg(th.dimmed))
+        .title(format!("Tracks [{}]", app.tracks.len()));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    if app.tracks.is_empty() {
+        let msg = Line::from(Span::styled("No tracks", Style::default().fg(th.dimmed)));
+        f.render_widget(Paragraph::new(vec![msg]), inner);
+        return;
+    }
+
+    let height = inner.height as usize;
+    let offset = if app.selected_idx >= height {
+        app.selected_idx - height + 1
+    } else {
+        0
+    };
+
+    let end = (offset + height).min(app.tracks.len());
+    let mut lines = Vec::with_capacity(end - offset);
+
+    for i in offset..end {
+        let path = &app.tracks[i];
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("Unknown");
+        let is_playing = i == app.idx;
+        let is_sel = i == app.selected_idx;
+
+        let prefix = if is_playing { "> " } else { "  " };
+        let style = if is_sel {
+            Style::default().fg(th.primary).add_modifier(Modifier::REVERSED)
+        } else if is_playing {
+            Style::default().fg(th.secondary).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(th.text)
+        };
+
+        lines.push(Line::from(vec![
+            Span::styled(prefix, style),
+            Span::styled(name, style),
+        ]));
+    }
+
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 fn render_visualizer(f: &mut Frame, app: &App, area: Rect) {
@@ -277,4 +352,48 @@ fn render_bottom(f: &mut Frame, app: &App, area: Rect) {
         .label(Span::styled(label, Style::default().fg(th.text)));
 
     f.render_widget(gauge, area);
+}
+
+fn render_help(f: &mut Frame, app: &App) {
+    let th = app.theme();
+    let area = f.area();
+    let w = 46.min(area.width);
+    let h = 15.min(area.height);
+    let rect = Rect {
+        x: area.x + (area.width.saturating_sub(w)) / 2,
+        y: area.y + (area.height.saturating_sub(h)) / 2,
+        width: w,
+        height: h,
+    };
+
+    f.render_widget(Clear, rect);
+
+    let binds = [
+        ("Space", "Play / Pause"),
+        ("s", "Restart / Skip"),
+        ("+ / -", "Volume Up / Down"),
+        ("[ / ]", "Lyrics Offset (-/+100ms)"),
+        ("v", "Visualizer Mode"),
+        ("t", "Color Theme"),
+        ("Tab / p", "Toggle Track Drawer"),
+        ("j / k (Up/Down)", "Select Track"),
+        ("Enter", "Play Selected Track"),
+        ("?", "Toggle Keybindings"),
+        ("q / Esc", "Quit / Close"),
+    ];
+
+    let mut lines = Vec::with_capacity(binds.len());
+    for (k, desc) in binds {
+        lines.push(Line::from(vec![
+            Span::styled(format!("  {:<18}", k), Style::default().fg(th.primary).add_modifier(Modifier::BOLD)),
+            Span::styled(desc, Style::default().fg(th.text)),
+        ]));
+    }
+
+    let block = Block::bordered()
+        .border_type(BorderType::Plain)
+        .border_style(Style::default().fg(th.accent))
+        .title("Keybindings");
+
+    f.render_widget(Paragraph::new(lines).block(block), rect);
 }

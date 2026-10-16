@@ -2,7 +2,7 @@ use std::f32::consts::PI;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
-use anyhow::{bail, Result};
+use anyhow::{anyhow, Result};
 use crossterm::event::KeyCode;
 use rustfft::{num_complex::Complex, Fft, FftPlanner};
 
@@ -42,6 +42,9 @@ pub struct App {
     pub audio: Audio,
     pub tracks: Vec<PathBuf>,
     pub idx: usize,
+    pub selected_idx: usize,
+    pub show_sidebar: bool,
+    pub show_help: bool,
     pub quit: bool,
     pub bins: Vec<f32>,
     pub peaks: Vec<f32>,
@@ -60,23 +63,44 @@ pub struct App {
 impl App {
     pub fn new(target: Option<PathBuf>) -> Result<Self> {
         let audio = Audio::new()?;
-        let mut tracks = Vec::new();
-
-        if let Some(p) = target {
+        let (tracks, start_idx) = if let Some(p) = target {
             if !p.exists() {
-                bail!("path does not exist: {}", p.display());
+                return Err(anyhow!("path does not exist: {}", p.display()));
             }
-            tracks = collect_tracks(&p)?;
-            if tracks.is_empty() {
-                bail!("no audio files found (.mp3, .wav, .flac) in: {}", p.display());
+            if p.is_dir() {
+                let list = collect_tracks(&p)?;
+                if list.is_empty() {
+                    return Err(anyhow!("no audio files found (.mp3, .wav, .flac) in: {}", p.display()));
+                }
+                (list, 0)
+            } else {
+                let parent = p.parent().unwrap_or(Path::new("."));
+                let mut list = collect_tracks(parent)?;
+                if list.is_empty() {
+                    list.push(p.clone());
+                }
+                let mut pos = 0;
+                for (i, t) in list.iter().enumerate() {
+                    if t == &p {
+                        pos = i;
+                        break;
+                    }
+                }
+                (list, pos)
             }
-        }
+        } else {
+            let list = collect_tracks(Path::new("."))?;
+            (list, 0)
+        };
 
         let mut planner = FftPlanner::<f32>::new();
         let fft = planner.plan_fft_forward(FFT_SIZE);
-        let window = (0..FFT_SIZE)
-            .map(|i| 0.5 * (1.0 - (2.0 * PI * i as f32 / (FFT_SIZE as f32 - 1.0)).cos()))
-            .collect();
+        let mut window = Vec::with_capacity(FFT_SIZE);
+        for i in 0..FFT_SIZE {
+            let w = 0.5 * (1.0 - (2.0 * PI * i as f32 / (FFT_SIZE as f32 - 1.0)).cos());
+            window.push(w);
+        }
+
         let fft_buf = vec![Complex { re: 0.0, im: 0.0 }; FFT_SIZE];
         let bins = vec![0.0; NUM_BINS];
         let peaks = vec![0.0; NUM_BINS];
@@ -85,7 +109,10 @@ impl App {
         let mut app = Self {
             audio,
             tracks,
-            idx: 0,
+            idx: start_idx,
+            selected_idx: start_idx,
+            show_sidebar: false,
+            show_help: false,
             quit: false,
             bins,
             peaks,
@@ -129,7 +156,43 @@ impl App {
 
     pub fn handle_key(&mut self, code: KeyCode) -> Result<()> {
         match code {
-            KeyCode::Char('q') => self.quit = true,
+            KeyCode::Char('q') => {
+                if self.show_help {
+                    self.show_help = false;
+                } else {
+                    self.quit = true;
+                }
+            }
+            KeyCode::Esc => {
+                if self.show_help {
+                    self.show_help = false;
+                } else if self.show_sidebar {
+                    self.show_sidebar = false;
+                }
+            }
+            KeyCode::Char('?') => self.show_help = !self.show_help,
+            KeyCode::Tab | KeyCode::Char('p') => {
+                self.show_sidebar = !self.show_sidebar;
+                if self.show_sidebar {
+                    self.selected_idx = self.idx;
+                }
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                if self.show_sidebar && !self.tracks.is_empty() {
+                    self.selected_idx = (self.selected_idx + 1).min(self.tracks.len() - 1);
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                if self.show_sidebar && !self.tracks.is_empty() {
+                    self.selected_idx = self.selected_idx.saturating_sub(1);
+                }
+            }
+            KeyCode::Enter => {
+                if self.show_sidebar && !self.tracks.is_empty() {
+                    self.idx = self.selected_idx;
+                    self.load_current()?;
+                }
+            }
             KeyCode::Char(' ') => self.audio.toggle_pause(),
             KeyCode::Char('s') => self.skip()?,
             KeyCode::Char('v') => self.viz_mode = self.viz_mode.next(),
@@ -154,6 +217,7 @@ impl App {
             return Ok(());
         }
         self.idx = (self.idx + 1) % self.tracks.len();
+        self.selected_idx = self.idx;
         self.load_current()
     }
 
@@ -161,6 +225,7 @@ impl App {
         if !self.tracks.is_empty() && self.audio.is_empty() && !self.audio.is_paused() {
             if self.idx + 1 < self.tracks.len() {
                 self.idx += 1;
+                self.selected_idx = self.idx;
                 self.load_current()?;
             }
         }
@@ -174,26 +239,33 @@ impl App {
     }
 
     pub fn wave_samples(&self, count: usize) -> Vec<f32> {
-        match self.audio.samples.try_lock() {
-            Ok(ring) if ring.len() >= count => {
-                let skip = ring.len() - count;
-                ring.iter().skip(skip).copied().collect()
+        let mut out = vec![0.0; count];
+        if let Ok(ring) = self.audio.samples.try_lock() {
+            let len = ring.len();
+            if len >= count {
+                let offset = len - count;
+                for i in 0..count {
+                    out[i] = ring[offset + i];
+                }
             }
-            _ => vec![0.0; count],
         }
+        out
     }
 
     pub fn stereo_samples(&self, count: usize) -> (Vec<f32>, Vec<f32>) {
-        match self.audio.stereo.try_lock() {
-            Ok(s) if s.0.len() >= count => {
-                let skip = s.0.len() - count;
-                (
-                    s.0.iter().skip(skip).copied().collect(),
-                    s.1.iter().skip(skip).copied().collect(),
-                )
+        let mut left = vec![0.0; count];
+        let mut right = vec![0.0; count];
+        if let Ok(s) = self.audio.stereo.try_lock() {
+            let len = s.0.len();
+            if len >= count {
+                let offset = len - count;
+                for i in 0..count {
+                    left[i] = s.0[offset + i];
+                    right[i] = s.1[offset + i];
+                }
             }
-            _ => (vec![0.0; count], vec![0.0; count]),
         }
+        (left, right)
     }
 
     fn update_fft(&mut self) {
@@ -211,15 +283,18 @@ impl App {
             return;
         }
 
-        let samples: Vec<f32> = match self.audio.samples.try_lock() {
-            Ok(ring) if ring.len() >= FFT_SIZE => {
-                let skip = ring.len() - FFT_SIZE;
-                ring.iter().skip(skip).copied().collect()
+        let Ok(ring) = self.audio.samples.try_lock() else {
+            for b in &mut self.bins {
+                *b = (*b - decay).max(0.0);
             }
-            _ => Vec::new(),
+            for p in &mut self.peaks {
+                *p = (*p - peak_decay * 2.0).max(0.0);
+            }
+            self.pulse = (self.pulse - 0.07).max(0.0);
+            return;
         };
 
-        if samples.len() < FFT_SIZE {
+        if ring.len() < FFT_SIZE {
             for b in &mut self.bins {
                 *b = (*b - decay).max(0.0);
             }
@@ -230,18 +305,26 @@ impl App {
             return;
         }
 
-        for (i, (&s, &w)) in samples.iter().zip(self.window.iter()).enumerate() {
+        let offset = ring.len() - FFT_SIZE;
+        for i in 0..FFT_SIZE {
+            let s = ring[offset + i];
+            let w = self.window[i];
             self.fft_buf[i] = Complex { re: s * w, im: 0.0 };
         }
         self.fft.process(&mut self.fft_buf);
 
         let half = FFT_SIZE / 2;
-        let mags: Vec<f32> = self.fft_buf[..half]
-            .iter()
-            .map(|c| (c.re * c.re + c.im * c.im).sqrt() / FFT_SIZE as f32)
-            .collect();
+        let mut mags = Vec::with_capacity(half);
+        for c in &self.fft_buf[..half] {
+            mags.push((c.re * c.re + c.im * c.im).sqrt() / FFT_SIZE as f32);
+        }
 
-        let bass_energy: f32 = mags[1..=6].iter().sum::<f32>() / 6.0;
+        let mut bass_sum = 0.0;
+        for &m in &mags[1..=6] {
+            bass_sum += m;
+        }
+        let bass_energy = bass_sum / 6.0;
+
         if bass_energy > self.bass_avg * 1.35 && bass_energy > 0.012 {
             self.pulse = 1.0;
         }
@@ -264,7 +347,10 @@ impl App {
             let start = i0.clamp(1, half - 1);
             let end = i1.clamp(start + 1, half);
 
-            let sum: f32 = mags[start..end].iter().sum();
+            let mut sum = 0.0;
+            for &m in &mags[start..end] {
+                sum += m;
+            }
             let avg = sum / (end - start) as f32;
 
             let db = 20.0 * (avg * 4.0 + 1e-6).log10();
@@ -287,11 +373,11 @@ impl App {
     }
 
     pub fn track_name(&self) -> &str {
-        self.tracks
-            .get(self.idx)
-            .and_then(|p| p.file_name())
-            .and_then(|n| n.to_str())
-            .unwrap_or("No track loaded")
+        if let Some(p) = self.tracks.get(self.idx) {
+            p.file_name().and_then(|n| n.to_str()).unwrap_or("No track loaded")
+        } else {
+            "No track loaded"
+        }
     }
 
     pub fn state_str(&self) -> &'static str {
@@ -324,8 +410,10 @@ fn collect_tracks(target: &Path) -> Result<Vec<PathBuf>> {
 }
 
 fn is_audio(p: &Path) -> bool {
-    matches!(
-        p.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).as_deref(),
-        Some("mp3" | "wav" | "flac")
-    )
+    if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
+        let ext = ext.to_ascii_lowercase();
+        ext == "mp3" || ext == "wav" || ext == "flac"
+    } else {
+        false
+    }
 }
