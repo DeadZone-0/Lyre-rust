@@ -9,27 +9,36 @@ lyre is a terminal music player and audio spectrum visualizer written in Rust. I
 - [Demo 1: Local file playback, bars visualizer, and lyrics sync](assets/recording_2026-10-16_21-22-13.mp4)
 - [Demo 2: MPRIS system capture, oscilloscope mode, and album cover rendering](assets/recording_2026-10-16_21-25-24.mp4)
 
-## Dependencies
+## Installation
 
-Building requires Rust (1.80 or newer), ALSA development headers, and D-Bus development headers.
+### Shell Installer (Prebuilt Binary)
 
-### Debian / Ubuntu
+```bash
+curl -fsSL https://raw.githubusercontent.com/DeadZone-0/Lyre-rust/main/install.sh | sh
+```
+
+This downloads the latest prebuilt `lyre` binary for your architecture and installs it to `~/.local/bin`.
+
+### Build from Source
+
+Building from source requires Rust (1.80 or newer), ALSA development headers, and D-Bus development headers.
+
+#### Debian / Ubuntu
 ```bash
 sudo apt-get install -y libasound2-dev libdbus-1-dev pkg-config
 ```
 
-### Arch Linux
+#### Arch Linux
 ```bash
 sudo pacman -S --needed alsa-lib dbus pkgconf
 ```
 
-### Fedora
+#### Fedora
 ```bash
 sudo dnf install -y alsa-lib-devel dbus-devel pkgconf-pkg-config
 ```
 
-## Build and Installation
-
+Compile with cargo:
 ```bash
 cargo build --release
 ```
